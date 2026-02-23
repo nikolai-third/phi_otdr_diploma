@@ -1,85 +1,75 @@
 # Бакалаврский диплом: phi-OTDR
 
-Этот репозиторий — рабочее пространство бакалаврского диплома по теме:
+Репозиторий для дипломной работы по теме:
 **«Исследование методов обработки данных в фазочувствительной рефлектометрии на длинных оптических линиях с усилителями»**.
 
-Аудит датасета (`src/audit`) — только первый шаг пайплайна. Далее в репозитории будут добавляться этапы предобработки, выделения признаков, анализа событий, экспериментов и отчётных материалов.
+`dataset audit` и `baseline pipeline` — воспроизводимые этапы первичной обработки и контроля качества всего массива данных.
 
-## Структура проекта
+## Данные и ограничения
 
-- `data/raw` — symlink на WebDAV (`/Volumes/webdav.yandex.ru/phi-OTDR`)
-- `data/interim` — промежуточные артефакты (включая результаты аудита)
-- `data/processed` — данные после этапов обработки
-- `reports/figures`, `reports/tables` — артефакты отчётов
-- `notebooks` — исследовательские ноутбуки
-- `src/audit` — CLI и логика аудита данных (первый этап)
-- `tests` — тесты `pytest`
+- `data/raw` — symlink на WebDAV: `/Volumes/webdav.yandex.ru/phi-OTDR`
+- Объём датасета большой (десятки ГБ)
+- Чтение только ленивое/выборочное
+- Для устойчивости используется локальный кэш `cache/`
 
-## Требования
+## Архитектура pipeline
 
-- Python 3.10+
-- Зависимости: `numpy`, `pandas`, `pyarrow`, `tqdm`, `h5py`, `PyYAML`, `pytest`
+- `src/audit` — аудит и каталог файлов (`catalog.parquet`)
+- `src/index/prepare.py` — построение processing-index (`index.parquet`)
+- `src/utils/cache.py` — `ensure_local(path, cache_dir)` для локального кеширования файлов
+- `src/baseline/run.py` — массовая baseline-аналитика с checkpoint/resume
+- `src/baseline/artifacts.py` — генерация графиков/таблиц/markdown summary
+- `src/pipeline.py` — единый CLI `run-all`
+- `src/utils/logging_config.py` — глобальное логирование в консоль и `logs/pipeline.log`
+
+## Структура директорий
+
+- `cache/` — локальные копии файлов с WebDAV
+- `logs/` — `pipeline.log` и `errors.log`
+- `data/interim/` — `catalog.parquet`, `index.parquet`
+- `data/processed/` — `baseline_metrics.parquet`
+- `reports/figures/` — графики baseline
+- `reports/tables/` — csv-таблицы baseline
 
 ## Установка
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
-pip install -e .[dev]
+# При доступе в интернет:
+# pip install -e .[dev]
 ```
 
-## Запуск аудита
+## Основные команды
 
-Базовая команда:
+1. Построить индекс (если нужен вручную):
 
 ```bash
-python -m src.audit scan --root data/raw --out data/interim/catalog.parquet
+python -m src.index build --catalog data/interim/catalog.parquet --out data/interim/dataset_index.parquet
 ```
 
-Параметры:
-
-- `--max-files` — ограничить число файлов (например, 200 для быстрой проверки)
-- `--sample-bytes` — сколько байт читать для magic header (default: `64`)
-- `--qc-max-bytes` — лимит на объём выборки для QC (default: `5000000`)
-- `--workers` — число потоков чтения метаданных (default: `4`)
-- `--parquet-schema-max-bytes` — лимит размера parquet, после которого schema-read пропускается (default: `2000000`)
-
-Пример быстрой проверки:
+2. Полный baseline pipeline:
 
 ```bash
-python -m src.audit scan \
-  --root data/raw \
-  --out data/interim/catalog.parquet \
-  --max-files 200 \
-  --workers 4
+python -m src.pipeline run-all
 ```
 
-## Что создаётся
+CLI поддерживает параметры:
+- `--max-workers` (не более 4)
+- `--max-bytes` (объём сэмпла на файл)
+- `--checkpoint-every` (по умолчанию 50)
 
-- `data/interim/catalog.parquet` — основной каталог
-- `data/interim/catalog.csv` — облегчённый просмотр
-- `data/interim/summary.md` — человекочитаемая сводка
+## Поведение run-all
 
-## Поддерживаемые форматы метаданных
-
-- `.h5/.hdf5`: список datasets, shape/dtype, root attrs, безопасный QC-сэмпл
-- `.npy`: shape/dtype, безопасный QC-сэмпл
-- `.npz`: список массивов с shape/dtype
-- `.json/.yaml/.yml`: ключи (для небольших файлов)
-- `.txt`: автоопределение кодировки (включая `cp1251/cp866`) + превью текста и key/value-пары
-- `.csv`: колонки (header-only)
-- `.parquet`: схема и типы колонок
-- Прочие бинарники: magic bytes (`sample-bytes`) и MIME guess
-
-## WebDAV: ограничения и рекомендации
-
-- WebDAV имеет высокую латентность на множество мелких запросов.
-- Используйте умеренный `--workers` (обычно `2..6`) и `--max-files` для первых прогонов.
-- Не увеличивайте `--qc-max-bytes` без необходимости.
-- Для повторяющихся экспериментов полезно кэшировать нужные подмножества локально в `data/interim`/`data/processed`.
-
-## Тесты
-
-```bash
-pytest
-```
+- создаёт нужные директории (`cache`, `logs`, `data/processed`, `reports/*`)
+- создаёт `data/interim/index.parquet`, если его нет
+- обрабатывает только не обработанные ранее `record_id`
+- сохраняет результаты инкрементально в `data/processed/baseline_metrics.parquet`
+- пишет ошибки отдельных файлов в `logs/errors.log`, не останавливая pipeline
+- генерирует:
+  - `reports/figures/hist_file_sizes.png`
+  - `reports/figures/hist_std_distribution.png`
+  - `reports/figures/format_distribution.png`
+  - `reports/figures/scatter_size_vs_std.png`
+  - `reports/tables/top20_largest_files.csv`
+  - `reports/summary_baseline.md`
