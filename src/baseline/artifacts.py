@@ -54,6 +54,17 @@ def build_artifacts(
     ax.grid(True, alpha=0.2)
     _save_fig(fig, figures / "hist_file_sizes.png")
 
+    fig, ax = plt.subplots(figsize=(8, 4))
+    size_positive = df["file_size_mb"].dropna()
+    size_positive = size_positive[size_positive > 0]
+    ax.hist(size_positive, bins=40, log=True)
+    ax.set_xscale("log")
+    ax.set_xlabel("File size, MB (log scale)")
+    ax.set_ylabel("Count (log scale)")
+    ax.set_title("Histogram of file sizes (log)")
+    ax.grid(True, alpha=0.2)
+    _save_fig(fig, figures / "hist_file_sizes_log.png")
+
     # 2) std distribution histogram
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.hist(ok_df["sample_std"].replace([np.inf, -np.inf], np.nan).dropna(), bins=40)
@@ -89,10 +100,80 @@ def build_artifacts(
     ax.grid(True, alpha=0.2)
     _save_fig(fig, figures / "scatter_size_vs_std.png")
 
+    # std by format for major groups
+    top_formats = (
+        ok_df["inferred_format"].fillna("unknown").value_counts().head(6).index.tolist()
+        if not ok_df.empty
+        else []
+    )
+    if top_formats:
+        box_data = []
+        labels = []
+        for fmt in top_formats:
+            vals = (
+                ok_df.loc[ok_df["inferred_format"] == fmt, "sample_std"]
+                .replace([np.inf, -np.inf], np.nan)
+                .dropna()
+                .values
+            )
+            if len(vals) > 0:
+                box_data.append(vals)
+                labels.append(fmt)
+        if box_data:
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.boxplot(box_data, labels=labels, showfliers=False)
+            ax.set_xlabel("Format")
+            ax.set_ylabel("Sample std")
+            ax.set_title("Sample std by format")
+            ax.grid(True, axis="y", alpha=0.2)
+            _save_fig(fig, figures / "box_std_by_format.png")
+
     # tables
     format_counts.to_csv(tables / "format_distribution.csv", index=False)
     df[["record_id", "path", "status", "error"]].to_csv(tables / "baseline_status.csv", index=False)
     df.describe(include="all").to_csv(tables / "baseline_describe.csv")
+
+    summary_by_format = (
+        df.groupby("inferred_format", dropna=False)
+        .agg(
+            files=("record_id", "count"),
+            ok=("status", lambda s: int((s == "ok").sum())),
+            errors=("status", lambda s: int((s != "ok").sum())),
+            total_size_mb=("file_size_mb", "sum"),
+            mean_std=("sample_std", "mean"),
+            p90_std=("sample_std", lambda x: float(pd.Series(x).quantile(0.9))),
+        )
+        .reset_index()
+        .sort_values("files", ascending=False)
+    )
+    summary_by_format.to_csv(tables / "summary_by_format.csv", index=False)
+
+    summary_by_group = (
+        df.groupby("file_group", dropna=False)
+        .agg(
+            files=("record_id", "count"),
+            ok=("status", lambda s: int((s == "ok").sum())),
+            errors=("status", lambda s: int((s != "ok").sum())),
+            total_size_mb=("file_size_mb", "sum"),
+            mean_std=("sample_std", "mean"),
+        )
+        .reset_index()
+        .sort_values("total_size_mb", ascending=False)
+    )
+    summary_by_group.to_csv(tables / "summary_by_group.csv", index=False)
+
+    noise_quantiles = ok_df["sample_std"].replace([np.inf, -np.inf], np.nan).dropna().quantile(
+        [0.1, 0.25, 0.5, 0.75, 0.9, 0.99]
+    )
+    noise_quantiles_df = noise_quantiles.rename_axis("quantile").reset_index(name="sample_std")
+    noise_quantiles_df.to_csv(tables / "noise_quantiles.csv", index=False)
+
+    top_noisy = (
+        ok_df.sort_values("sample_std", ascending=False)
+        .head(20)[["record_id", "path", "inferred_format", "file_size_mb", "sample_std"]]
+        .copy()
+    )
+    top_noisy.to_csv(tables / "top20_noisiest_files.csv", index=False)
 
     # summary markdown
     total_files = int(len(df))
@@ -124,20 +205,46 @@ def build_artifacts(
         f"- Int dtype share: **{(int_count / max(1, len(ok_df))):.2%}**",
         f"- Error count: **{int(len(err_df))}**",
         "",
+        "## Coverage",
+        "",
+        f"- Successful records: **{int((df['status'] == 'ok').sum())}**",
+        f"- Failed records: **{int((df['status'] != 'ok').sum())}**",
+        f"- Cache volume (approx): **{Path('cache').exists() and 'see `du -sh cache`' or 'n/a'}**",
+        "",
         "## Noise Observations",
         "",
         f"- {noise_observation}",
         "",
+        "## Top Noisy Files",
+        "",
+    ]
+    if not top_noisy.empty:
+        lines.append("| record_id | path | format | sample_std |")
+        lines.append("|---|---|---|---:|")
+        for row in top_noisy.head(10).itertuples(index=False):
+            lines.append(f"| {row.record_id} | {row.path} | {row.inferred_format} | {float(row.sample_std):.6g} |")
+    else:
+        lines.append("- No noisy-file ranking available.")
+
+    lines.extend(
+        [
+        "",
         "## Generated Artifacts",
         "",
         "- reports/figures/hist_file_sizes.png",
+        "- reports/figures/hist_file_sizes_log.png",
         "- reports/figures/hist_std_distribution.png",
         "- reports/figures/format_distribution.png",
+        "- reports/figures/box_std_by_format.png",
         "- reports/figures/scatter_size_vs_std.png",
         "- reports/tables/top20_largest_files.csv",
+        "- reports/tables/top20_noisiest_files.csv",
         "- reports/tables/format_distribution.csv",
+        "- reports/tables/summary_by_format.csv",
+        "- reports/tables/summary_by_group.csv",
+        "- reports/tables/noise_quantiles.csv",
         "- reports/tables/baseline_status.csv",
-    ]
+    ])
 
     out_summary = Path(summary_path)
     out_summary.parent.mkdir(parents=True, exist_ok=True)

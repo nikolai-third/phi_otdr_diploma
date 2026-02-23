@@ -121,44 +121,53 @@ def _sample_h5(path: Path, max_bytes: int) -> tuple[np.ndarray, str, str]:
 
 
 def _sample_parquet(path: Path, max_bytes: int) -> tuple[np.ndarray, str, str]:
-    pf = pq.ParquetFile(path)
-    schema = pf.schema_arrow
+    try:
+        pf = pq.ParquetFile(path)
+        schema = pf.schema_arrow
 
-    list_cols: list[str] = []
-    numeric_cols: list[str] = []
-    for field in schema:
-        if patypes.is_list(field.type) or patypes.is_large_list(field.type):
-            list_cols.append(field.name)
-        elif patypes.is_integer(field.type) or patypes.is_floating(field.type):
-            numeric_cols.append(field.name)
+        list_cols: list[str] = []
+        numeric_cols: list[str] = []
+        for field in schema:
+            if patypes.is_list(field.type) or patypes.is_large_list(field.type):
+                list_cols.append(field.name)
+            elif patypes.is_integer(field.type) or patypes.is_floating(field.type):
+                numeric_cols.append(field.name)
 
-    if list_cols:
-        batch_iter = pf.iter_batches(columns=[list_cols[0]], batch_size=16)
-        try:
-            batch = next(batch_iter)
-            rows = batch.column(0).to_pylist()
-            arrays = [np.asarray(r, dtype=np.float64) for r in rows if isinstance(r, (list, tuple)) and len(r) > 0]
-            if arrays:
-                width = min(len(a) for a in arrays)
-                matrix = np.vstack([a[:width] for a in arrays])
-                sample = matrix.reshape(-1)[: _max_elements(np.dtype(np.float64), max_bytes)]
-                return sample, str(matrix.shape), "float64"
-        except StopIteration:
-            pass
+        if list_cols:
+            batch_iter = pf.iter_batches(columns=[list_cols[0]], batch_size=16)
+            try:
+                batch = next(batch_iter)
+                rows = batch.column(0).to_pylist()
+                arrays = [np.asarray(r, dtype=np.float64) for r in rows if isinstance(r, (list, tuple)) and len(r) > 0]
+                if arrays:
+                    width = min(len(a) for a in arrays)
+                    matrix = np.vstack([a[:width] for a in arrays])
+                    sample = matrix.reshape(-1)[: _max_elements(np.dtype(np.float64), max_bytes)]
+                    return sample, str(matrix.shape), "float64"
+            except StopIteration:
+                pass
 
-    preferred_cols = [c for c in numeric_cols if c.lower() == "data"] + [c for c in numeric_cols if c.lower() != "data"]
-    if preferred_cols:
-        batch_size = min(1_000_000, _max_elements(np.dtype(np.float64), max_bytes) * 2)
-        batch_iter = pf.iter_batches(columns=[preferred_cols[0]], batch_size=batch_size)
-        try:
-            batch = next(batch_iter)
-            values = batch.column(0).to_numpy(zero_copy_only=False)
-            sample = np.asarray(values).reshape(-1)[: _max_elements(np.asarray(values).dtype, max_bytes)]
-            return sample, str((int(len(values)),)), str(np.asarray(values).dtype)
-        except StopIteration:
-            pass
+        preferred_cols = [c for c in numeric_cols if c.lower() == "data"] + [c for c in numeric_cols if c.lower() != "data"]
+        if preferred_cols:
+            batch_size = min(1_000_000, _max_elements(np.dtype(np.float64), max_bytes) * 2)
+            batch_iter = pf.iter_batches(columns=[preferred_cols[0]], batch_size=batch_size)
+            try:
+                batch = next(batch_iter)
+                values = batch.column(0).to_numpy(zero_copy_only=False)
+                sample = np.asarray(values).reshape(-1)[: _max_elements(np.asarray(values).dtype, max_bytes)]
+                return sample, str((int(len(values)),)), str(np.asarray(values).dtype)
+            except StopIteration:
+                pass
+    except Exception as exc:
+        LOGGER.warning("parquet fallback for %s: %s", path, exc)
 
-    return np.array([]), "()", "unknown"
+    # Fallback for malformed .parquet-like binaries: treat leading bytes as int16 stream.
+    with path.open("rb") as fp:
+        raw = fp.read(max_bytes)
+    if not raw:
+        return np.array([]), "()", "bytes"
+    arr = np.frombuffer(raw, dtype=np.int16)
+    return arr, str((int(arr.size),)), "int16-fallback"
 
 
 def _extract_metrics(local_path: Path, inferred_format: str, max_bytes: int) -> dict[str, Any]:
@@ -194,7 +203,9 @@ def _write_error(errors_path: Path, record_id: str, path: str, message: str) -> 
 def _load_processed_ids(metrics_path: Path) -> set[str]:
     if not metrics_path.exists():
         return set()
-    df = pd.read_parquet(metrics_path, columns=["record_id"])
+    df = pd.read_parquet(metrics_path)
+    if "status" in df.columns:
+        df = df[df["status"] == "ok"]
     return set(df["record_id"].astype(str).tolist())
 
 
