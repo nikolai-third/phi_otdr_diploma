@@ -1,0 +1,6 @@
+"""CLI module for `python -m src.audit`."""
+
+from .scan import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
