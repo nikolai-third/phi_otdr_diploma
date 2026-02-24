@@ -27,3 +27,5 @@ reports/figures/*
 !reports/figures/.gitkeep
 reports/tables/*
 !reports/tables/.gitkeep
+
+legacy
