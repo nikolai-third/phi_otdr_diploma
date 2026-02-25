@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -27,9 +27,9 @@ import pyarrow.parquet as pq
 
 @dataclass(frozen=True)
 class ParseConfig:
-    trace_len: int = 55_000
+    trace_len: int | None = None
     max_traces: int = 500
-    min_gap_factor: float = 1.15
+    min_gap_factor: float = 0.82
     low_level_factor: float = 0.10
     rise_factor: float = 0.075
     max_shift: int = 300
@@ -102,7 +102,9 @@ def _envelopes(x: np.ndarray, alpha: float) -> tuple[np.ndarray, np.ndarray, np.
     return upper, lower, mid
 
 
-def _detect_starts(data: np.ndarray, cfg: ParseConfig) -> np.ndarray:
+def _collect_start_candidates(data: np.ndarray, cfg: ParseConfig) -> np.ndarray:
+    """Return dense start candidates before period-based spacing filter."""
+
     dec = max(1, int(cfg.decimation))
     dec_data = data[::dec]
     sm = _moving_average(dec_data, cfg.ma_window)
@@ -146,8 +148,57 @@ def _detect_starts(data: np.ndarray, cfg: ParseConfig) -> np.ndarray:
     if not raw_starts:
         return np.array([], dtype=np.int64)
 
-    starts = np.array(sorted(raw_starts), dtype=np.int64)
-    min_gap = int(cfg.trace_len * cfg.min_gap_factor)
+    return np.array(sorted(raw_starts), dtype=np.int64)
+
+
+def _estimate_trace_len_from_candidates(candidates: np.ndarray, fallback: int = 55_000) -> int:
+    """Estimate reflectogram length from candidate start gaps without external prior."""
+
+    if len(candidates) < 3:
+        return fallback
+
+    diffs = np.diff(candidates).astype(np.float64)
+    diffs = diffs[(diffs > 1_000) & (diffs < 2_000_000)]
+    if len(diffs) == 0:
+        return fallback
+
+    period_votes: list[float] = []
+    vote_weights: list[float] = []
+    for d in diffs:
+        max_k = min(12, max(1, int(d // 10_000)))
+        for k in range(1, max_k + 1):
+            p = d / float(k)
+            if 5_000 <= p <= 300_000:
+                period_votes.append(p)
+                vote_weights.append(1.0 / np.sqrt(float(k)))
+
+    if not period_votes:
+        return fallback
+
+    values = np.asarray(period_votes, dtype=np.float64)
+    weights = np.asarray(vote_weights, dtype=np.float64)
+    bin_size = 100.0
+    bins = np.floor(values / bin_size).astype(np.int64)
+    uniq, inv = np.unique(bins, return_inverse=True)
+    agg = np.zeros(len(uniq), dtype=np.float64)
+    np.add.at(agg, inv, weights)
+
+    best_bin = uniq[int(np.argmax(agg))]
+    center = float(best_bin) * bin_size
+    near = values[np.abs(values - center) <= 2_000.0]
+    if len(near) == 0:
+        est = center
+    else:
+        est = float(np.median(near))
+    return int(round(est))
+
+
+def _detect_starts(data: np.ndarray, cfg: ParseConfig, trace_len: int) -> np.ndarray:
+    starts = _collect_start_candidates(data, cfg)
+    if len(starts) == 0:
+        return starts
+
+    min_gap = max(1, int(trace_len * cfg.min_gap_factor))
     filtered = [int(starts[0])]
     for s in starts[1:]:
         if int(s) - filtered[-1] >= min_gap:
@@ -156,10 +207,10 @@ def _detect_starts(data: np.ndarray, cfg: ParseConfig) -> np.ndarray:
     starts = np.array(filtered, dtype=np.int64)
     if len(starts) <= 1 or not cfg.fill_missing:
         return starts
-    return _recover_starts_periodic(data=data, anchors=starts, cfg=cfg)
+    return _recover_starts_periodic(data=data, anchors=starts, cfg=cfg, trace_len=trace_len)
 
 
-def _recover_starts_periodic(data: np.ndarray, anchors: np.ndarray, cfg: ParseConfig) -> np.ndarray:
+def _recover_starts_periodic(data: np.ndarray, anchors: np.ndarray, cfg: ParseConfig, trace_len: int) -> np.ndarray:
     """Recover missing starts by phase-locked periodic tracking around v1 anchors."""
 
     n_samples = len(data)
@@ -170,7 +221,7 @@ def _recover_starts_periodic(data: np.ndarray, anchors: np.ndarray, cfg: ParseCo
     # Estimate true period from anchor gaps: gaps may skip multiple reflectograms.
     period_parts: list[float] = []
     for gap in diffs:
-        k = max(1, int(round(float(gap) / float(cfg.trace_len))))
+        k = max(1, int(round(float(gap) / float(trace_len))))
         period_parts.append(float(gap) / float(k))
     period = int(round(float(np.median(period_parts))))
     if period <= 0:
@@ -191,7 +242,7 @@ def _recover_starts_periodic(data: np.ndarray, anchors: np.ndarray, cfg: ParseCo
     # Extrapolate to file edges using estimated period.
     while predicted and predicted[0] - period >= 0:
         predicted.insert(0, predicted[0] - period)
-    while predicted and predicted[-1] + period + cfg.trace_len <= n_samples:
+    while predicted and predicted[-1] + period + trace_len <= n_samples:
         predicted.append(predicted[-1] + period)
 
     if not predicted:
@@ -218,7 +269,7 @@ def _recover_starts_periodic(data: np.ndarray, anchors: np.ndarray, cfg: ParseCo
         return anchors
 
     rec_arr = np.array(sorted(set(refined)), dtype=np.int64)
-    rec_arr = rec_arr[rec_arr + cfg.trace_len <= n_samples]
+    rec_arr = rec_arr[rec_arr + trace_len <= n_samples]
     if len(rec_arr) == 0:
         return anchors
 
@@ -353,7 +404,7 @@ def _plot_waterfall(traces: np.ndarray, out: Path, title: str, fs_hz: float) -> 
     _save_plot(out, fig)
 
 
-def _auto_tune_config(data: np.ndarray, cfg: ParseConfig) -> ParseConfig:
+def _auto_tune_config(data: np.ndarray, cfg: ParseConfig, trace_len: int) -> ParseConfig:
     tune_data = data[: min(len(data), 12_000_000)]
 
     low_grid = [0.07, 0.09, 0.10, 0.12]
@@ -367,7 +418,7 @@ def _auto_tune_config(data: np.ndarray, cfg: ParseConfig) -> ParseConfig:
         for rise in rise_grid:
             for gap in gap_grid:
                 candidate = ParseConfig(
-                    trace_len=cfg.trace_len,
+                    trace_len=trace_len,
                     max_traces=cfg.max_traces,
                     min_gap_factor=gap,
                     low_level_factor=low,
@@ -396,12 +447,12 @@ def _auto_tune_config(data: np.ndarray, cfg: ParseConfig) -> ParseConfig:
                     recovery_corr_decimation=cfg.recovery_corr_decimation,
                 )
 
-                starts = _detect_starts(tune_data, candidate)
+                starts = _detect_starts(tune_data, candidate, trace_len=trace_len)
                 if len(starts) < 20:
                     continue
                 try:
                     traces = _extract_reflectograms(
-                        tune_data, starts, trace_len=candidate.trace_len, max_traces=candidate.max_traces
+                        tune_data, starts, trace_len=trace_len, max_traces=candidate.max_traces
                     )
                     _, shifts = _align_traces_cc(traces, candidate)
                 except Exception:
@@ -419,7 +470,7 @@ def _auto_tune_config(data: np.ndarray, cfg: ParseConfig) -> ParseConfig:
     return best_cfg
 
 
-def _extract_with_fallbacks(data: np.ndarray, cfg: ParseConfig) -> tuple[ParseConfig, np.ndarray, np.ndarray]:
+def _extract_with_fallbacks(data: np.ndarray, cfg: ParseConfig, trace_len: int) -> tuple[ParseConfig, np.ndarray, np.ndarray]:
     """Try primary config and a few nearby configs to avoid empty extraction."""
 
     candidates: list[ParseConfig] = [cfg]
@@ -429,7 +480,7 @@ def _extract_with_fallbacks(data: np.ndarray, cfg: ParseConfig) -> tuple[ParseCo
                 for dec in [cfg.decimation, 8, 10]:
                     candidates.append(
                         ParseConfig(
-                            trace_len=cfg.trace_len,
+                            trace_len=trace_len,
                             max_traces=cfg.max_traces,
                             min_gap_factor=gap,
                             low_level_factor=low,
@@ -466,11 +517,11 @@ def _extract_with_fallbacks(data: np.ndarray, cfg: ParseConfig) -> tuple[ParseCo
         if key in seen:
             continue
         seen.add(key)
-        starts = _detect_starts(data, c)
+        starts = _detect_starts(data, c, trace_len=trace_len)
         if len(starts) == 0:
             continue
         try:
-            traces = _extract_reflectograms(data, starts, trace_len=c.trace_len, max_traces=c.max_traces)
+            traces = _extract_reflectograms(data, starts, trace_len=trace_len, max_traces=c.max_traces)
         except Exception:
             continue
         n = traces.shape[0]
@@ -484,16 +535,24 @@ def _extract_with_fallbacks(data: np.ndarray, cfg: ParseConfig) -> tuple[ParseCo
     return best[1], best[2], best[3]
 
 
-def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float | int]:
+def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float | int | str]:
     data = _read_data_stream(path, max_points=cfg.max_samples)
+    if cfg.trace_len is None:
+        raw_candidates = _collect_start_candidates(data, cfg)
+        trace_len = _estimate_trace_len_from_candidates(raw_candidates)
+        trace_len_source = "inferred"
+    else:
+        trace_len = int(cfg.trace_len)
+        trace_len_source = "manual"
+    cfg_work = replace(cfg, trace_len=trace_len)
 
-    if cfg.auto_tune:
-        cfg = _auto_tune_config(data, cfg)
+    if cfg_work.auto_tune:
+        cfg_work = _auto_tune_config(data, cfg_work, trace_len=trace_len)
 
-    cfg, starts, traces = _extract_with_fallbacks(data, cfg)
-    residual_before = _estimate_residual_jitter(traces, cfg)
-    aligned_candidate, shifts_candidate = _align_traces_cc(traces, cfg)
-    residual_after_candidate = _estimate_residual_jitter(aligned_candidate, cfg)
+    cfg_work, starts, traces = _extract_with_fallbacks(data, cfg_work, trace_len=trace_len)
+    residual_before = _estimate_residual_jitter(traces, cfg_work)
+    aligned_candidate, shifts_candidate = _align_traces_cc(traces, cfg_work)
+    residual_after_candidate = _estimate_residual_jitter(aligned_candidate, cfg_work)
 
     alignment_applied = residual_after_candidate[0] < residual_before[0]
     if alignment_applied:
@@ -505,13 +564,24 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
         shifts = np.zeros(traces.shape[0], dtype=np.int64)
         residual_after = residual_before
 
-    _plot_raw_segment(data, starts, outdir / "parser_raw_segment.png", points=cfg.raw_plot_points, fs_hz=cfg.adc_fs_hz)
-    _plot_waterfall(traces, outdir / "parser_waterfall_before.png", "Waterfall before alignment", fs_hz=cfg.adc_fs_hz)
-    _plot_waterfall(aligned, outdir / "parser_waterfall_after.png", "Waterfall after cross-correlation alignment", fs_hz=cfg.adc_fs_hz)
+    _plot_raw_segment(
+        data,
+        starts,
+        outdir / "parser_raw_segment.png",
+        points=cfg_work.raw_plot_points,
+        fs_hz=cfg_work.adc_fs_hz,
+    )
+    _plot_waterfall(traces, outdir / "parser_waterfall_before.png", "Waterfall before alignment", fs_hz=cfg_work.adc_fs_hz)
+    _plot_waterfall(
+        aligned,
+        outdir / "parser_waterfall_after.png",
+        "Waterfall after cross-correlation alignment",
+        fs_hz=cfg_work.adc_fs_hz,
+    )
 
-    detected_period = int(round(float(np.median(np.diff(starts))))) if len(starts) > 1 else int(cfg.trace_len)
+    detected_period = int(round(float(np.median(np.diff(starts))))) if len(starts) > 1 else int(trace_len)
     detected_period = max(1, detected_period)
-    expected_traces = max(0, (len(data) - cfg.trace_len) // detected_period + 1)
+    expected_traces = max(0, (len(data) - trace_len) // detected_period + 1)
     coverage = float(len(starts) / expected_traces) if expected_traces > 0 else 0.0
 
     metrics = {
@@ -519,7 +589,8 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
         "n_detected_starts": int(len(starts)),
         "n_extracted_traces": int(traces.shape[0]),
         "trace_len": int(traces.shape[1]),
-        "trace_duration_us": float(traces.shape[1] * 1e6 / cfg.adc_fs_hz),
+        "trace_len_source": trace_len_source,
+        "trace_duration_us": float(traces.shape[1] * 1e6 / cfg_work.adc_fs_hz),
         "shift_abs_mean": float(np.mean(np.abs(shifts))),
         "shift_abs_p95": float(np.quantile(np.abs(shifts), 0.95)),
         "shift_std": float(np.std(shifts)),
@@ -531,18 +602,19 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
         "expected_traces": int(expected_traces),
         "coverage_ratio": coverage,
         "detected_period_points": int(detected_period),
-        "detected_period_us": float(detected_period * 1e6 / cfg.adc_fs_hz),
+        "detected_period_us": float(detected_period * 1e6 / cfg_work.adc_fs_hz),
     }
 
     lines = [
         "# Parser Diagnostics",
         "",
         f"- file: `{path}`",
-        f"- ADC sampling rate: **{cfg.adc_fs_hz:.0f} Hz**",
+        f"- ADC sampling rate: **{cfg_work.adc_fs_hz:.0f} Hz**",
         f"- samples: **{metrics['n_samples']}**",
         f"- detected starts: **{metrics['n_detected_starts']}**",
         f"- extracted traces: **{metrics['n_extracted_traces']}**",
         f"- trace_len: **{metrics['trace_len']} points**",
+        f"- trace_len source: **{metrics['trace_len_source']}**",
         f"- detected period: **{metrics['detected_period_points']} points ({metrics['detected_period_us']:.3f} us)**",
         f"- expected traces by period: **{metrics['expected_traces']}**",
         f"- coverage: **{100.0 * metrics['coverage_ratio']:.2f}%**",
@@ -568,32 +640,34 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
         json.dumps(
             {
                 "trace_len": cfg.trace_len,
-                "max_traces": cfg.max_traces,
-                "min_gap_factor": cfg.min_gap_factor,
-                "low_level_factor": cfg.low_level_factor,
-                "rise_factor": cfg.rise_factor,
-                "max_shift": cfg.max_shift,
-                "cc_window_start": cfg.cc_window_start,
-                "cc_window_len": cfg.cc_window_len,
-                "raw_plot_points": cfg.raw_plot_points,
-                "auto_tune": cfg.auto_tune,
-                "adc_fs_hz": cfg.adc_fs_hz,
-                "decimation": cfg.decimation,
-                "ma_window": cfg.ma_window,
-                "envelope_alpha": cfg.envelope_alpha,
-                "refine_radius": cfg.refine_radius,
-                "align_iters": cfg.align_iters,
-                "align_decimation": cfg.align_decimation,
-                "max_samples": cfg.max_samples,
-                "fill_missing": cfg.fill_missing,
-                "fill_gap_factor": cfg.fill_gap_factor,
-                "recovery_search_radius": cfg.recovery_search_radius,
-                "recovery_anchor_tol": cfg.recovery_anchor_tol,
-                "recovery_low_weight": cfg.recovery_low_weight,
-                "recovery_pre_window": cfg.recovery_pre_window,
-                "recovery_min_spacing_factor": cfg.recovery_min_spacing_factor,
-                "recovery_corr_len": cfg.recovery_corr_len,
-                "recovery_corr_decimation": cfg.recovery_corr_decimation,
+                "trace_len_used": trace_len,
+                "trace_len_source": trace_len_source,
+                "max_traces": cfg_work.max_traces,
+                "min_gap_factor": cfg_work.min_gap_factor,
+                "low_level_factor": cfg_work.low_level_factor,
+                "rise_factor": cfg_work.rise_factor,
+                "max_shift": cfg_work.max_shift,
+                "cc_window_start": cfg_work.cc_window_start,
+                "cc_window_len": cfg_work.cc_window_len,
+                "raw_plot_points": cfg_work.raw_plot_points,
+                "auto_tune": cfg_work.auto_tune,
+                "adc_fs_hz": cfg_work.adc_fs_hz,
+                "decimation": cfg_work.decimation,
+                "ma_window": cfg_work.ma_window,
+                "envelope_alpha": cfg_work.envelope_alpha,
+                "refine_radius": cfg_work.refine_radius,
+                "align_iters": cfg_work.align_iters,
+                "align_decimation": cfg_work.align_decimation,
+                "max_samples": cfg_work.max_samples,
+                "fill_missing": cfg_work.fill_missing,
+                "fill_gap_factor": cfg_work.fill_gap_factor,
+                "recovery_search_radius": cfg_work.recovery_search_radius,
+                "recovery_anchor_tol": cfg_work.recovery_anchor_tol,
+                "recovery_low_weight": cfg_work.recovery_low_weight,
+                "recovery_pre_window": cfg_work.recovery_pre_window,
+                "recovery_min_spacing_factor": cfg_work.recovery_min_spacing_factor,
+                "recovery_corr_len": cfg_work.recovery_corr_len,
+                "recovery_corr_decimation": cfg_work.recovery_corr_decimation,
             },
             ensure_ascii=False,
             indent=2,
@@ -608,7 +682,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m src.parser.one_file", description="Run reflectogram parser on one file")
     parser.add_argument("--file", type=Path, required=True)
     parser.add_argument("--outdir", type=Path, default=Path("reports/figures/parser"))
-    parser.add_argument("--trace-len", type=int, default=55_000)
+    parser.add_argument(
+        "--trace-len",
+        type=int,
+        default=None,
+        help="Reflectogram length in points. If omitted, parser estimates it from signal.",
+    )
     parser.add_argument("--max-traces", type=int, default=500)
     parser.add_argument("--min-gap-factor", type=float, default=1.15)
     parser.add_argument("--low-level-factor", type=float, default=0.10)
