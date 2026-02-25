@@ -130,6 +130,8 @@ python -m src.parser.one_file --file <path_to_file.parquet> --outdir reports/fig
 - `--trace-len` — длина одной рефлектограммы в точках (опционально; по умолчанию оценивается из сигнала).
 - `--max-samples` — ограничение по числу точек для быстрого теста.
 - `--max-traces` — верхняя граница числа извлекаемых трасс.
+- `--waterfall-cmap` — цветовая схема heatmap (по умолчанию `jet`, как в классических phi-OTDR waterfall).
+- `--waterfall-exp-alpha` — коэффициент экспоненциального контрастирования (поднимает низкие уровни).
 
 ### Ключевые метрики в `parser_diagnostics.md`
 
