@@ -29,3 +29,4 @@ reports/tables/*
 !reports/tables/.gitkeep
 
 legacy
+data
