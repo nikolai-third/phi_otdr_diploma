@@ -61,7 +61,13 @@ CLI поддерживает параметры:
 
 ## Парсер рефлектограмм
 
-Парсер для одного файла находится в `src/parser/one_file.py` и запускается через:
+Парсер разбит на модули:
+- `src/parser/core.py` — детекция стартов, оценка периода и извлечение рефлектограмм.
+- `src/parser/templates.py` — шаблонное доуточнение стартов и кросс-корреляционное выравнивание.
+- `src/parser/io.py` — потоковое чтение parquet, построение графиков и запись диагностик.
+- `src/parser/one_file.py` — CLI-обёртка для запуска на одном файле.
+
+Запуск:
 
 ```bash
 python -m src.parser.one_file --file <path_to_file.parquet> --outdir reports/figures/parser_run

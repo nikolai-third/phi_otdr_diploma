@@ -18,6 +18,13 @@ import sys
 import time
 from typing import Any
 
+_cache_root = (Path("data") / "interim" / ".cache").resolve()
+_mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+_cache_root.mkdir(parents=True, exist_ok=True)
+_mpl_root.mkdir(parents=True, exist_ok=True)
+os.environ["XDG_CACHE_HOME"] = str(_cache_root)
+os.environ["MPLCONFIGDIR"] = str(_mpl_root)
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -25,16 +32,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
-from src.parser.one_file import (
-    ParseConfig,
-    _align_traces_cc,
-    _collect_start_candidates,
-    _estimate_residual_jitter,
-    _extract_with_fallbacks,
-    _infer_trace_len,
-    _read_data_stream,
-    _select_alignment_window,
-)
+from src.parser.config import ParseConfig
+from src.parser.core import collect_start_candidates, extract_with_fallbacks, infer_trace_len
+from src.parser.io import read_data_stream
+from src.parser.templates import align_traces_cc, estimate_residual_jitter, select_alignment_window
 from src.utils.logging_config import setup_logging
 
 
@@ -111,22 +112,20 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
     rdir = _record_dir(out_root, raw_root, src)
     rdir.mkdir(parents=True, exist_ok=True)
 
-    data = _read_data_stream(src, max_points=cfg.max_samples)
-    raw_candidates = _collect_start_candidates(data)
-    trace_len = _infer_trace_len(data, raw_candidates)
-    cfg_work = cfg
+    data = read_data_stream(src, max_points=cfg.max_samples)
+    raw_candidates = collect_start_candidates(data)
+    trace_len = infer_trace_len(data, raw_candidates)
+    starts, traces = extract_with_fallbacks(data, trace_len=trace_len, max_traces=cfg.max_traces)
 
-    cfg_work, starts, traces = _extract_with_fallbacks(data, cfg_work, trace_len=trace_len)
-
-    if cfg_work.auto_select_cc_window:
-        cc_start = _select_alignment_window(traces, cfg_work)
-        cfg_align = replace(cfg_work, cc_window_start=cc_start)
+    if cfg.auto_select_cc_window:
+        cc_start = select_alignment_window(traces, cfg)
+        cfg_align = replace(cfg, cc_window_start=cc_start)
     else:
-        cfg_align = cfg_work
+        cfg_align = cfg
 
-    residual_before = _estimate_residual_jitter(traces, cfg_align)
-    aligned_cc, shifts = _align_traces_cc(traces, cfg_align)
-    residual_after = _estimate_residual_jitter(aligned_cc, cfg_align)
+    residual_before = estimate_residual_jitter(traces, cfg_align)
+    aligned_cc, shifts = align_traces_cc(traces, cfg_align)
+    residual_after = estimate_residual_jitter(aligned_cc, cfg_align)
     apply_alignment = residual_after[0] < residual_before[0]
     aligned = aligned_cc if apply_alignment else traces
 
@@ -140,7 +139,7 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
         aligned=aligned_out,
         starts=starts.astype(np.int64, copy=False),
         trace_len=np.int32(trace_len),
-        adc_fs_hz=np.float64(cfg_work.adc_fs_hz),
+        adc_fs_hz=np.float64(cfg.adc_fs_hz),
         source_path=str(src),
     )
 
@@ -148,7 +147,7 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
         aligned=aligned,
         starts=starts,
         trace_len=int(trace_len),
-        adc_fs_hz=float(cfg_work.adc_fs_hz),
+        adc_fs_hz=float(cfg.adc_fs_hz),
         out_path=rdir / "waterfall_raw.png",
     )
 
@@ -254,8 +253,8 @@ def main(argv: list[str] | None = None) -> int:
             meta = _run_one(src=src, raw_root=raw_root, out_root=out_root, cfg=cfg, save_dtype=args.save_dtype)
             _append_jsonl(manifest_ok, meta)
             ok += 1
-        except Exception as e:  # noqa: BLE001
-            row = {"source_rel": str(src.relative_to(raw_root)), "error": f"{type(e).__name__}: {e}"}
+        except Exception as exc:  # noqa: BLE001
+            row = {"source_rel": str(src.relative_to(raw_root)), "error": f"{type(exc).__name__}: {exc}"}
             _append_jsonl(manifest_err, row)
             LOG.exception("Failed: %s", src)
             err += 1
