@@ -35,7 +35,7 @@ from tqdm import tqdm
 from src.parser.config import ParseConfig
 from src.parser.core import collect_start_candidates, extract_with_fallbacks, infer_trace_len
 from src.parser.io import read_data_stream
-from src.parser.templates import align_traces_cc, estimate_residual_jitter, select_alignment_window
+from src.parser.templates import align_traces_cc, estimate_residual_jitter, select_alignment_window, should_apply_alignment
 from src.utils.logging_config import setup_logging
 
 
@@ -81,6 +81,8 @@ def _save_waterfall_raw(
     adc_fs_hz: float,
     out_path: Path,
     refractive_index: float = 1.468,
+    max_rows: int = 1200,
+    max_cols: int = 4000,
 ) -> None:
     c0 = 299_792_458.0
     dist_km = (np.arange(trace_len, dtype=np.float64) * (c0 / (2.0 * refractive_index * adc_fs_hz))) / 1000.0
@@ -90,13 +92,25 @@ def _save_waterfall_raw(
     else:
         t_max = float(aligned.shape[0] / max(1.0, adc_fs_hz / max(1, trace_len)))
 
+    rows, cols = aligned.shape
+    r_block = max(1, int(np.ceil(rows / max(1, int(max_rows)))))
+    c_block = max(1, int(np.ceil(cols / max(1, int(max_cols)))))
+    rows_trim = (rows // r_block) * r_block
+    cols_trim = (cols // c_block) * c_block
+    disp = np.asarray(aligned[:rows_trim, :cols_trim], dtype=np.float32)
+    if r_block > 1:
+        disp = disp.reshape(rows_trim // r_block, r_block, cols_trim).mean(axis=1)
+    if c_block > 1:
+        disp = disp.reshape(disp.shape[0], cols_trim // c_block, c_block).mean(axis=2)
+
     fig, ax = plt.subplots(figsize=(12, 5))
     im = ax.imshow(
-        aligned,
+        disp,
         origin="lower",
         aspect="auto",
         extent=[float(dist_km[0]), float(dist_km[-1]), 0.0, t_max],
         cmap="jet",
+        interpolation="nearest",
     )
     fig.colorbar(im, ax=ax, label="Raw amplitude")
     ax.set_xlabel("Distance, km")
@@ -112,10 +126,11 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
     rdir = _record_dir(out_root, raw_root, src)
     rdir.mkdir(parents=True, exist_ok=True)
 
-    data = read_data_stream(src, max_points=cfg.max_samples)
+    data = read_data_stream(src)
     raw_candidates = collect_start_candidates(data)
     trace_len = infer_trace_len(data, raw_candidates)
     starts, traces = extract_with_fallbacks(data, trace_len=trace_len, max_traces=cfg.max_traces)
+    n_extracted = int(traces.shape[0])
 
     if cfg.auto_select_cc_window:
         cc_start = select_alignment_window(traces, cfg)
@@ -126,8 +141,19 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
     residual_before = estimate_residual_jitter(traces, cfg_align)
     aligned_cc, shifts = align_traces_cc(traces, cfg_align)
     residual_after = estimate_residual_jitter(aligned_cc, cfg_align)
-    apply_alignment = residual_after[0] < residual_before[0]
+    apply_alignment = should_apply_alignment(
+        before=residual_before,
+        after=residual_after,
+        traces_before=traces,
+        traces_after=aligned_cc,
+        start=int(cfg_align.cc_window_start),
+        end=int(min(traces.shape[1], cfg_align.cc_window_start + cfg_align.cc_window_len)),
+    )
     aligned = aligned_cc if apply_alignment else traces
+    residual_effective = residual_after if apply_alignment else residual_before
+    shifts_effective = shifts if apply_alignment else np.zeros_like(shifts)
+    if apply_alignment:
+        del traces
 
     if save_dtype == "float16":
         aligned_out = aligned.astype(np.float16, copy=False)
@@ -142,6 +168,7 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
         adc_fs_hz=np.float64(cfg.adc_fs_hz),
         source_path=str(src),
     )
+    del aligned_out
 
     _save_waterfall_raw(
         aligned=aligned,
@@ -149,6 +176,8 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
         trace_len=int(trace_len),
         adc_fs_hz=float(cfg.adc_fs_hz),
         out_path=rdir / "waterfall_raw.png",
+        max_rows=cfg.plot_max_traces,
+        max_cols=cfg.plot_max_bins,
     )
 
     meta = {
@@ -157,14 +186,14 @@ def _run_one(src: Path, raw_root: Path, out_root: Path, cfg: ParseConfig, save_d
         "elapsed_sec": float(time.time() - t0),
         "n_samples": int(len(data)),
         "n_detected_starts": int(len(starts)),
-        "n_extracted_traces": int(traces.shape[0]),
+        "n_extracted_traces": n_extracted,
         "trace_len": int(trace_len),
         "alignment_applied": bool(apply_alignment),
         "residual_before_abs_mean": float(residual_before[0]),
         "residual_before_abs_p95": float(residual_before[1]),
-        "residual_after_abs_mean": float(residual_after[0]),
-        "residual_after_abs_p95": float(residual_after[1]),
-        "shift_abs_mean": float(np.mean(np.abs(shifts))),
+        "residual_after_abs_mean": float(residual_effective[0]),
+        "residual_after_abs_p95": float(residual_effective[1]),
+        "shift_abs_mean": float(np.mean(np.abs(shifts_effective))),
         "cc_window_start_used": int(cfg_align.cc_window_start),
         "cc_window_len_used": int(cfg_align.cc_window_len),
         "config": asdict(cfg_align),
@@ -178,13 +207,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="python -m src.parser.batch_usb", description="Batch parse all parquet files to USB cache")
     p.add_argument("--raw-root", type=Path, default=Path("data/raw_usb"))
     p.add_argument("--out-root", type=Path, default=Path("data/processed_usb/parser_cache"))
-    p.add_argument("--max-samples", type=int, default=50_000_000)
-    p.add_argument("--max-traces", type=int, default=2_000)
     p.add_argument("--max-shift", type=int, default=450)
-    p.add_argument("--align-iters", type=int, default=3)
+    p.add_argument("--align-iters", type=int, default=1)
     p.add_argument("--align-decimation", type=int, default=2)
     p.add_argument("--save-dtype", choices=["float16", "float32"], default="float16")
     p.add_argument("--limit", type=int, default=None, help="Optional limit for quick smoke run")
+    p.add_argument("--force", action="store_true", help="Reprocess files even if cache artifacts already exist")
     p.add_argument("--log", type=Path, default=Path("logs/parser_batch_usb.log"))
     p.add_argument("--daemon", action="store_true", help="Run detached in background")
     p.add_argument("--daemon-out", type=Path, default=Path("logs/parser_batch_usb.out"))
@@ -228,18 +256,19 @@ def main(argv: list[str] | None = None) -> int:
     manifest_err = out_root / "manifest_err.jsonl"
 
     cfg = ParseConfig(
-        max_traces=args.max_traces,
         max_shift=args.max_shift,
         align_iters=args.align_iters,
         align_decimation=args.align_decimation,
-        max_samples=args.max_samples,
         auto_select_cc_window=True,
     )
 
     all_files = _list_candidates(raw_root)
     if args.limit is not None:
         all_files = all_files[: args.limit]
-    todo = [p for p in all_files if not _is_done(out_root, raw_root, p)]
+    if args.force:
+        todo = all_files
+    else:
+        todo = [p for p in all_files if not _is_done(out_root, raw_root, p)]
 
     LOG.info("Candidates=%d, todo=%d, skipped_done=%d", len(all_files), len(todo), len(all_files) - len(todo))
     if not todo:

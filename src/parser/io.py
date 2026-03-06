@@ -12,8 +12,10 @@ from typing import Any
 
 _cache_root = (Path("data") / "interim" / ".cache").resolve()
 _mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+_memmap_root = (_cache_root / "parser_memmap").resolve()
 _cache_root.mkdir(parents=True, exist_ok=True)
 _mpl_root.mkdir(parents=True, exist_ok=True)
+_memmap_root.mkdir(parents=True, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = str(_cache_root)
 os.environ["MPLCONFIGDIR"] = str(_mpl_root)
 
@@ -26,7 +28,7 @@ import pyarrow.parquet as pq
 
 from src.parser.config import ParseConfig
 from src.parser.core import parse_reflectograms
-from src.parser.templates import align_traces_cc, estimate_residual_jitter, select_alignment_window
+from src.parser.templates import align_traces_cc, estimate_residual_jitter, select_alignment_window, should_apply_alignment
 
 
 def sanitize_tag(text: str, max_len: int = 80) -> str:
@@ -47,32 +49,74 @@ def build_source_tag(path: Path) -> str:
     return f"{parent}__{stem}__{digest}"
 
 
-def read_data_stream(path: Path, max_points: int | None = None) -> np.ndarray:
-    """Read parquet `data` column in streaming mode."""
+def read_data_stream(path: Path) -> np.ndarray:
+    """Read full parquet `data` column into persistent float32 memmap."""
 
     pf = pq.ParquetFile(path)
-    chunks: list[np.ndarray] = []
-    total = 0
-
-    for batch in pf.iter_batches(columns=["data"], batch_size=1_000_000):
-        arr = batch.column(0).to_numpy(zero_copy_only=False)
-        if max_points is not None and total + len(arr) > max_points:
-            arr = arr[: max_points - total]
-        chunks.append(np.asarray(arr, dtype=np.float64))
-        total += len(arr)
-        if max_points is not None and total >= max_points:
-            break
-
-    if not chunks:
+    total_rows = int(pf.metadata.num_rows or 0)
+    if total_rows <= 0:
         raise ValueError(f"No data in parquet column 'data': {path}")
 
-    return np.concatenate(chunks)
+    st = path.stat()
+    key = hashlib.sha1(
+        f"{path.resolve()}::{st.st_size}::{st.st_mtime_ns}::float32::{total_rows}".encode("utf-8")
+    ).hexdigest()[:16]
+    map_name = f"{sanitize_tag(path.stem, max_len=40)}__{key}.f32.mmap"
+    map_path = _memmap_root / map_name
+    expected_size = total_rows * np.dtype(np.float32).itemsize
+
+    if map_path.exists() and map_path.stat().st_size == expected_size:
+        return np.memmap(map_path, mode="r", dtype=np.float32, shape=(total_rows,))
+
+    tmp_path = map_path.with_suffix(map_path.suffix + ".tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    mm = np.memmap(tmp_path, mode="w+", dtype=np.float32, shape=(total_rows,))
+    offset = 0
+    for batch in pf.iter_batches(columns=["data"], batch_size=1_000_000):
+        arr = np.asarray(batch.column(0).to_numpy(zero_copy_only=False), dtype=np.float32)
+        n = int(arr.size)
+        if n == 0:
+            continue
+        end = offset + n
+        if end > total_rows:
+            raise ValueError(f"Parquet data overflow while reading {path}")
+        mm[offset:end] = arr
+        offset = end
+
+    if offset != total_rows:
+        raise ValueError(f"Parquet row mismatch for {path}: expected={total_rows}, read={offset}")
+    mm.flush()
+    del mm
+    tmp_path.replace(map_path)
+    return np.memmap(map_path, mode="r", dtype=np.float32, shape=(total_rows,))
 
 
 def _save_plot(path: Path, fig: plt.Figure) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def _downsample_for_display(traces: np.ndarray, max_rows: int, max_cols: int) -> np.ndarray:
+    """Display-only block averaging to keep plotting memory bounded.
+
+    Block averaging avoids alias artifacts that can appear with simple strided slicing.
+    """
+
+    rows, cols = traces.shape
+    r_block = max(1, int(np.ceil(rows / max(1, int(max_rows)))))
+    c_block = max(1, int(np.ceil(cols / max(1, int(max_cols)))))
+
+    rows_trim = (rows // r_block) * r_block
+    cols_trim = (cols // c_block) * c_block
+    x = np.asarray(traces[:rows_trim, :cols_trim], dtype=np.float32)
+    if r_block > 1:
+        x = x.reshape(rows_trim // r_block, r_block, cols_trim).mean(axis=1)
+    if c_block > 1:
+        x = x.reshape(x.shape[0], cols_trim // c_block, c_block).mean(axis=2)
+    return np.asarray(x, dtype=np.float32, copy=False)
 
 
 def plot_raw_segment(data: np.ndarray, starts: np.ndarray, out: Path, points: int, fs_hz: float) -> None:
@@ -92,15 +136,34 @@ def plot_raw_segment(data: np.ndarray, starts: np.ndarray, out: Path, points: in
     _save_plot(out, fig)
 
 
-def plot_waterfall(traces: np.ndarray, out: Path, title: str, fs_hz: float, cmap: str, exp_alpha: float) -> None:
+def plot_waterfall(
+    traces: np.ndarray,
+    starts: np.ndarray,
+    trace_len: int,
+    out: Path,
+    title: str,
+    fs_hz: float,
+    cmap: str,
+    exp_alpha: float,
+    max_rows: int,
+    max_cols: int,
+) -> None:
     dt_us = 1e6 / fs_hz
-    extent = [0.0, traces.shape[1] * dt_us, 0.0, float(traces.shape[0])]
+    if len(starts) > 1:
+        y = (starts[: traces.shape[0]] - starts[0]).astype(np.float64) / fs_hz
+        y_min = float(y[0])
+        y_max = float(y[-1])
+    else:
+        dt_trace = float(trace_len) / fs_hz
+        y_min = 0.0
+        y_max = dt_trace * max(1, traces.shape[0] - 1)
+    extent = [0.0, traces.shape[1] * dt_us, y_min, y_max]
 
-    data = traces.astype(np.float64)
+    data = _downsample_for_display(traces, max_rows=max_rows, max_cols=max_cols)
     q_lo = float(np.quantile(data, 0.005))
     q_hi = float(np.quantile(data, 0.995))
     span = max(1e-12, q_hi - q_lo)
-    normed = np.clip((data - q_lo) / span, 0.0, 1.0)
+    normed = np.clip((data - q_lo) / span, 0.0, 1.0).astype(np.float32, copy=False)
     if exp_alpha > 0.0:
         normed = (1.0 - np.exp(-exp_alpha * normed)) / (1.0 - np.exp(-exp_alpha))
 
@@ -109,7 +172,7 @@ def plot_waterfall(traces: np.ndarray, out: Path, title: str, fs_hz: float, cmap
     fig.colorbar(im, ax=ax)
     ax.set_title(title)
     ax.set_xlabel("Time inside reflectogram, us")
-    ax.set_ylabel("Trace index")
+    ax.set_ylabel("Time, s")
     _save_plot(out, fig)
 
 
@@ -175,7 +238,7 @@ def _write_parser_diagnostics(
 
 
 def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float | int | str]:
-    data = read_data_stream(path, max_points=cfg.max_samples)
+    data = read_data_stream(path)
     source_tag = build_source_tag(path)
 
     parse_result = parse_reflectograms(data, cfg)
@@ -193,13 +256,20 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
     aligned_candidate, shifts_candidate = align_traces_cc(traces, cfg_align)
     residual_after_candidate = estimate_residual_jitter(aligned_candidate, cfg_align)
 
-    alignment_applied = residual_after_candidate[0] < residual_before[0]
+    alignment_applied = should_apply_alignment(
+        before=residual_before,
+        after=residual_after_candidate,
+        traces_before=traces,
+        traces_after=aligned_candidate,
+        start=int(cfg_align.cc_window_start),
+        end=int(min(traces.shape[1], cfg_align.cc_window_start + cfg_align.cc_window_len)),
+    )
     if alignment_applied:
         aligned = aligned_candidate
         shifts = shifts_candidate
         residual_after = residual_after_candidate
     else:
-        aligned = traces.copy()
+        aligned = traces
         shifts = np.zeros(traces.shape[0], dtype=np.int64)
         residual_after = residual_before
 
@@ -216,19 +286,27 @@ def run_one_file(path: Path, outdir: Path, cfg: ParseConfig) -> dict[str, float 
     )
     plot_waterfall(
         traces,
-        outdir / waterfall_before_name,
-        "Waterfall before alignment",
+        starts=starts,
+        trace_len=trace_len,
+        out=outdir / waterfall_before_name,
+        title="Waterfall before alignment",
         fs_hz=cfg.adc_fs_hz,
         cmap=cfg.waterfall_cmap,
         exp_alpha=cfg.waterfall_exp_alpha,
+        max_rows=cfg.plot_max_traces,
+        max_cols=cfg.plot_max_bins,
     )
     plot_waterfall(
         aligned,
-        outdir / waterfall_after_name,
-        "Waterfall after cross-correlation alignment",
+        starts=starts,
+        trace_len=trace_len,
+        out=outdir / waterfall_after_name,
+        title="Waterfall after cross-correlation alignment",
         fs_hz=cfg.adc_fs_hz,
         cmap=cfg.waterfall_cmap,
         exp_alpha=cfg.waterfall_exp_alpha,
+        max_rows=cfg.plot_max_traces,
+        max_cols=cfg.plot_max_bins,
     )
 
     detected_period = int(round(float(np.median(np.diff(starts))))) if len(starts) > 1 else trace_len
