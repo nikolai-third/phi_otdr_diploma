@@ -21,6 +21,7 @@
 - `src/baseline/artifacts.py` — генерация графиков/таблиц/markdown summary
 - `src/pipeline.py` — единый CLI `run-all`
 - `src/utils/logging_config.py` — глобальное логирование в консоль и `logs/pipeline.log`
+- `src/parser/detect_from_aligned.py` — пост-детекция возмущений по выровненным рефлектограммам
 
 ## Структура директорий
 
@@ -66,6 +67,7 @@ CLI поддерживает параметры:
 - `src/parser/templates.py` — шаблонное доуточнение стартов и кросс-корреляционное выравнивание.
 - `src/parser/io.py` — потоковое чтение parquet, построение графиков и запись диагностик.
 - `src/parser/one_file.py` — CLI-обёртка для запуска на одном файле.
+- `src/parser/batch_usb.py` — пакетный прогон по `data/raw_usb` с сохранением в `data/processed_usb/parser_cache`.
 
 Запуск:
 
@@ -117,9 +119,9 @@ python -m src.parser.one_file --file <path_to_file.parquet> --outdir reports/fig
    - `T_i[r] = x[s_i + r]`, `r=0..L_hat-1`.
 
 7. Выравнивание кросс-корреляцией:
-   - в окне `[a, a+W)` для каждой трассы `T_i`:
-     - `τ_i = argmax_{|τ|<=S} corr(T_0[a:a+W], T_i[a+τ:a+W+τ])`;
-   - выравнивание применяется только если метрика residual jitter уменьшается.
+   - сначала оцениваются попарные лаги между соседними трассами в окне `[a, a+W)`;
+   - лаги робастно регуляризуются (подавление выбросов и дрейфа), затем интегрируются в абсолютные сдвиги;
+   - выравнивание применяется только если улучшаются метрики residual jitter/roughness.
 
 8. Временные пересчеты:
    - время точки: `t_us(n) = 1e6 * n / Fs`;
@@ -128,10 +130,29 @@ python -m src.parser.one_file --file <path_to_file.parquet> --outdir reports/fig
 ### Важные параметры
 
 - `--adc-fs-hz` — частота АЦП (в проекте: `50000000` Гц).
-- `--max-samples` — ограничение по числу точек для быстрого теста.
-- `--max-traces` — верхняя граница числа извлекаемых трасс.
 - `--waterfall-cmap` — цветовая схема heatmap (по умолчанию `jet`).
 - `--waterfall-exp-alpha` — коэффициент экспоненциального контрастирования (поднимает низкие уровни).
+
+Парсер всегда читает и обрабатывает **весь файл целиком**.
+Длина рефлектограммы (`trace_len`) и число извлечённых рефлектограмм (`n_extracted_traces`) вычисляются автоматически из сигнала.
+
+## Пост-детекция по выровненным данным
+
+Модуль: `src/parser/detect_from_aligned.py`
+
+Вход: `aligned.npz` из парсера (`data/processed_usb/parser_cache/records/<record>/aligned.npz`).
+
+Шаги:
+1. Робастный фон по времени (`median`) и residual.
+2. Нормировка residual по `MAD` для каждого distance-bin.
+3. FFT-карта по всей полосе частот (агностично к конкретной частоте воздействия).
+4. Комбинированный score: спектральные пики + широкополосная энергия + time-domain energy.
+5. Ограничение зоны поиска по `usable_end_km` (автооценка конца полезного сигнала).
+6. Экспорт пороговых кандидатов и top-candidate в usable-зоне.
+
+Ключевое поведение по умолчанию:
+- обрабатывается **весь файл** (`--max-traces` не задан);
+- crop по стабильному сегменту **выключен** (`--use-stable-segment` не указан).
 
 ### Ключевые метрики в `parser_diagnostics.md`
 
@@ -149,8 +170,24 @@ python -m src.parser.one_file --file <path_to_file.parquet> --outdir reports/fig
 python -m src.parser.one_file \
   --file data/raw/05_10_2024/2024-10-05_00_00.parquet \
   --outdir reports/figures/parser_v1 \
-  --adc-fs-hz 50000000 \
-  --max-samples 12000000
+  --adc-fs-hz 50000000
+```
+
+Детекция по уже выровненному файлу:
+
+```bash
+python -m src.parser.detect_from_aligned \
+  --aligned-npz data/processed_usb/parser_cache/records/some_test/2024-11-11_13_06/aligned.npz \
+  --outdir data/processed_usb/parser_cache/records/some_test/2024-11-11_13_06/detection_v2_full
+```
+
+Опционально (для эксперимента): ограничить обработку самым стабильным временным сегментом:
+
+```bash
+python -m src.parser.detect_from_aligned \
+  --aligned-npz <path_to_aligned.npz> \
+  --outdir <outdir> \
+  --use-stable-segment
 ```
 
 ## Поведение run-all
