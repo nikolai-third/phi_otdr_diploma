@@ -18,7 +18,7 @@
 - `post_align_detect_2024-10-11_18_59_tuned`: traces=999, detected=12, km=[0.000 ; 5.963 ; 10.946 ; 21.565 ; 26.589 ; 31.736 ; 37.127 ; 42.600 ; 46.684 ; 51.300 ; 54.322 ; 60.367]
 - `post_align_detect_2024-10-11_18_59_v2`: traces=999, detected=8, km=[5.963 ; 31.736 ; 34.268 ; 37.127 ; 42.600 ; 45.377 ; 49.135 ; 60.367]
 - `post_align_detect_2024-11-06_14_02`: traces=999, detected=7, km=[64.574 ; 81.973 ; 85.159 ; 88.181 ; 90.877 ; 98.842 ; 101.905]
-- `post_align_detect_2024-11-11_11_39`: traces=998, detected=5, km=[52.321 ; 55.507 ; 75.071 ; 95.574 ; 100.557]
+- `post_align_detect_2024-11-11_11_39`: traces=998, detected=5, km=[52.321 ; 55.507 ; 75.071 ; 95.574 ; 100.557] 
 
 ## USB Batch Records (`data/processed_usb/parser_cache`)
 
