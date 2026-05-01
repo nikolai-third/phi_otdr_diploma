@@ -1,0 +1,303 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usetheme{Madrid}
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{footline}[frame number]
+
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setdefaultlanguage{russian}
+\setotherlanguage{english}
+\setsansfont{Arial}
+\setmainfont{Times New Roman}
+\setmonofont{Courier New}
+\newfontfamily\cyrillicfont{Times New Roman}
+\newfontfamily\cyrillicfontsf{Arial}
+\newfontfamily\cyrillicfonttt{Courier New}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+
+\graphicspath{{slides/assets/}}
+
+\definecolor{phiBlue}{HTML}{0D3B66}
+\definecolor{phiTeal}{HTML}{0F6E8C}
+\definecolor{phiGreen}{HTML}{6AA84F}
+\definecolor{phiGray}{HTML}{4D4D4D}
+
+\newcommand{\tcell}[1]{\parbox[t]{\linewidth}{\raggedright\strut #1\strut}}
+
+\setbeamercolor{title}{fg=white}
+\setbeamercolor{frametitle}{fg=white, bg=phiBlue}
+\setbeamercolor{block title}{fg=white, bg=phiTeal}
+\setbeamercolor{block body}{fg=black, bg=black!3}
+\setbeamercolor{item}{fg=phiBlue}
+\setbeamercolor{structure}{fg=phiBlue}
+
+\title{Исследование методов обработки данных\\в фазочувствительной рефлектометрии\\на длинных оптических линиях с усилителями}
+\author{Студент группы Б02-212кт \\ Победин Николай Константинович}
+\institute{Министерство образования и науки Российской Федерации \\
+    Московский физико-технический институт (государственный университет) \\
+    Физтех-школа физики и исследований им. Ландау \\ 
+    Физтех-кластер академической и научной карьеры \\
+    (Фундаментальные проблемы физики квантовых технологий)}
+\date{2 апреля 2026}
+
+\begin{document}
+
+\begin{frame}
+    \titlepage
+\end{frame}
+
+\begin{frame}[t]{Введение и обзор литературы}
+    \footnotesize
+    \begin{itemize}
+        \item Оптическая рефлектометрия восстанавливает распределение обратного сигнала вдоль волокна по времени прихода рассеянного излучения.
+        \item Физическая основа сигнала - \textbf{обратное Рэлеевское рассеяние} на случайных микронеоднородностях стекла.
+        \item В классическом OTDR обычно анализируется усреднённый профиль мощности, поэтому для повышения отношения сигнал/шум требуется накопление большого числа трасс.
+        \item В \textbf{phase-sensitive OTDR} используется когерентное зондирование: вклады обратного Рэлеевского рассеяния интерферируют, а внешнее воздействие меняет их относительные фазы.
+        \item Поэтому информативными становятся изменения уже \textbf{между соседними рефлектограммами}; на практике для устойчивой автоматической локализации удобно использовать короткие окна из десятков или сотен трасс, а не только усреднённый профиль линии.
+    \end{itemize}
+
+    \vspace{0.4ex}
+    \begin{alertblock}{Сложность задачи на длинных линиях с усилителями}
+        \small
+        Большой объём данных, неоднородный профиль линии и слабый локальный контраст в raw waterfall делают ручной анализ ненадёжным. Поэтому нужен автоматический алгоритм: парсинг, выравнивание, подавление фона и локализация возмущений.
+    \end{alertblock}
+\end{frame}
+
+\begin{frame}{Цель и задачи исследования}
+    \begin{block}{Цель}
+        Разработать воспроизводимый метод обработки данных phi-OTDR, который позволяет автоматически выделять рефлектограммы из непрерывного сигнала, повышать интерпретируемость измерений и локализовать возмущения вдоль волоконной линии.
+    \end{block}
+
+    \vspace{0.5ex}
+    \begin{itemize}
+        \item Построить парсер, который сам определяет начала и длину рефлектограмм без внешней разметки.
+        \item Перевести данные в физически интерпретируемое представление расстояние - время.
+        \item Исследовать спектральные и робастные методы выделения возмущений.
+        \item Проверить работу метода на реальных данных с известными зонами воздействия.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[t]{Методы и материалы}
+    \vspace{0.2ex}
+    \begin{columns}[T,onlytextwidth]
+        \column{0.55\textwidth}
+        \raggedright
+        \includegraphics[width=\linewidth,height=0.37\textheight,keepaspectratio,page=1]{phi_otdr_scheme.pdf}
+
+        \column{0.40\textwidth}
+        \includegraphics[width=\linewidth,height=0.4\textheight,keepaspectratio]{single_reflectogram_example.png}
+    \end{columns}
+
+    \vspace{0.4ex}
+    \noindent
+    \begin{minipage}[t]{0.46\textwidth}
+        \begin{block}{Экспериментальные данные}
+            \scriptsize
+            \begin{itemize}
+                \item непрерывная запись с установки на рисунке выше;
+                \item частота АЦП: 50 МГц, длительность импульса: 100 нс;
+                \item объём записи: 1 секунда
+            \end{itemize}
+        \end{block}
+    \end{minipage}
+    \hfill
+    \begin{minipage}[t]{0.28\textwidth}
+        \begin{block}{Физическая интерпретация}
+            \scriptsize
+            Координата вдоль линии вычисляется как
+            \[
+                x = \frac{c\,t}{2n}, \qquad n \approx 1.468.
+            \]
+        \end{block}
+    \end{minipage}
+\end{frame}
+
+\begin{frame}[t]{Выровненные рефлектограммы и спектральный baseline}
+    \begin{columns}[T,onlytextwidth]
+        \column{0.50\textwidth}
+        \includegraphics[width=\linewidth,height=0.54\textheight,keepaspectratio]{aligned_waterfall_presentation.png}
+
+        \column{0.50\textwidth}
+        \includegraphics[width=\linewidth,height=0.54\textheight,keepaspectratio]{fourier_full_range_presentation.png}
+    \end{columns}
+
+    \vspace{0.5ex}
+    \scriptsize
+    \begin{itemize}
+        \item После парсинга и перевода в координаты расстояние - время видно, что вдоль линии существуют локальные аномальные зоны.
+        \item Fourier/STFT-карта подтверждает наличие спектрального следа возмущения и его локализацию по расстоянию.
+        \item Но полный спектральный просмотр для всех точек линии дорог: для окна из $K$ рефлектограмм длиной $M$ отсчётов лобовая карта без группировки масштабируется как $O(M\,K\log K)$, поэтому дальше спектральная информация сворачивается в компактный автоматический score.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[t]{Алгоритм детекции: идея и математическая схема}
+    \begin{center}
+        \resizebox{0.96\textwidth}{!}{
+            \begin{tikzpicture}[
+                node distance=0.55cm,
+                block/.style={draw=phiBlue, rounded corners=2pt, fill=phiBlue!7, align=center, minimum width=2.3cm, minimum height=0.95cm},
+                arrow/.style={-{Latex[length=2mm]}, thick, draw=phiBlue}
+            ]
+                \node[block] (a) {Aligned\\reflectograms};
+                \node[block, right=of a] (b) {Median\\background};
+                \node[block, right=of b] (c) {Residual\\signal};
+                \node[block, right=of c] (d) {MAD\\normalization};
+                \node[block, right=of d] (e) {FFT-based\\features};
+                \node[block, right=of e] (f) {Combined\\score + peaks};
+
+                \draw[arrow] (a) -- (b);
+                \draw[arrow] (b) -- (c);
+                \draw[arrow] (c) -- (d);
+                \draw[arrow] (d) -- (e);
+                \draw[arrow] (e) -- (f);
+            \end{tikzpicture}
+        }
+    \end{center}
+
+    \vspace{0.2ex}
+    \begin{block}{Робастная предобработка}
+        \small
+        \[
+            b(x)=\operatorname{med}_t I(x,t), \qquad
+            r(x,t)=I(x,t)-b(x)
+        \]
+        \[
+            s(x)=1.4826 \cdot \operatorname{med}_t \left| r(x,t)-\operatorname{med}_t r(x,t)\right|, \qquad
+            z(x,t)=\frac{r(x,t)}{s(x)+\varepsilon}
+        \]
+    \end{block}
+
+    \small
+    \begin{itemize}
+        \item $b(x)$ выделяет \textbf{стационарный профиль линии}: затухание, усилители, устойчивые отражающие участки.
+        \item $r(x,t)$ убирает постоянный фон и оставляет только отклонения относительно типичной рефлектограммы.
+        \item $s(x)$ задаёт \textbf{робастный масштаб} по расстоянию, а $z(x,t)$ становится входом для частотных и энергетических признаков.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[t]{Алгоритм детекции: фон и нормировка}
+    \begin{columns}[T,onlytextwidth]
+        \column{0.64\textwidth}
+        \includegraphics[width=\linewidth,height=0.39\textheight,keepaspectratio]{detect_step_background.png}
+
+        \vspace{0.4ex}
+        \includegraphics[width=\linewidth,height=0.39\textheight,keepaspectratio]{detect_step_mad_profile.png}
+
+        \column{0.36\textwidth}
+        {\footnotesize
+        \textbf{Что происходит на этом этапе}
+        \begin{itemize}
+            \item Медианный фон $b(x)$ описывает устойчивую форму линии как функцию расстояния.
+            \item MAD-масштаб показывает, где естественный разброс по времени велик, а где мал.
+            \item После нормировки сравнивается не абсолютная яркость, а статистически значимое отклонение.
+        \end{itemize}
+
+        \vspace{0.2ex}
+        \textbf{Робастная нормировка}
+        \[
+            z(x,t)=\frac{I(x,t)-\operatorname{med}_t I(x,t)}{1.4826\operatorname{MAD}_t(r)+\varepsilon}.
+        \]
+        }
+    \end{columns}
+\end{frame}
+
+\begin{frame}[t]{Алгоритм детекции: отдельные признаки}
+    \begin{center}
+        \includegraphics[width=0.97\linewidth,height=0.62\textheight,keepaspectratio]{detect_score_components_2x2_wide.png}
+    \end{center}
+
+    \scriptsize
+    \begin{itemize}
+        \item $S_{\text{peak}}$ реагирует на узкополосные компоненты, $S_{\text{broad}}$ - на широкополосные спектральные отклонения.
+        \item $E_z$ страхует случаи, когда событие видно по энергии во времени, но не доминирует на одной частоте; итоговый $S_{\text{comb}}$ строится как их взвешенная сумма.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}[t]{Короткое окно: 100 рефлектограмм}
+    \begin{columns}[T,onlytextwidth]
+        \column{0.70\textwidth}
+        \includegraphics[width=\linewidth,height=0.44\textheight,keepaspectratio]{short_window_score_100_presentation.png}
+
+        \column{0.30\textwidth}
+        {\scriptsize
+        \textbf{Что показывает окно 100 трасс}
+        \begin{itemize}
+            \item При $f_{\mathrm{rep}}\approx 1000$ Гц это всего \textbf{0.10 с} наблюдения.
+            \item Уже на таком окне видны два локальных максимума около \textbf{31.57 км} и \textbf{42.60 км}; на полном окне из 999 трасс они становятся устойчивыми итоговыми кандидатами.
+        \end{itemize}
+        }
+    \end{columns}
+
+    \vspace{0.5ex}
+    {\scriptsize
+    \textbf{Преимущества предлагаемого подхода}
+    \begin{itemize}
+        \item Спектральная информация всё ещё извлекается из всей записи, но в качестве конечного результата сохраняется не полная двумерная карта, а только \textbf{одномерный score по расстоянию}.
+        \item Это упрощает хранение, последующий анализ и автоматическое принятие решения: вместо time-frequency heatmap нужно рассматривать только один профиль вдоль линии.
+        \item В отличие от классического OTDR здесь сохраняется фазовая интерференционная динамика соседних трасс, поэтому информативны уже короткие окна измерения.
+    \end{itemize}
+    }
+\end{frame}
+
+\begin{frame}[t]{Итоговая локализация возмущений}
+    \begin{columns}[T,onlytextwidth]
+        \column{0.50\textwidth}
+        \includegraphics[width=\linewidth,height=0.56\textheight,keepaspectratio]{waterfall_zoom_30_35_presentation.png}
+
+        \column{0.50\textwidth}
+        \includegraphics[width=\linewidth,height=0.56\textheight,keepaspectratio]{waterfall_zoom_40_45_presentation.png}
+    \end{columns}
+
+    \vspace{0.7ex}
+    \small
+    \textbf{Контрольный случай:} автоматически получены два основных кандидата - \textbf{31.736 км} и \textbf{42.600 км}. Для ожидаемых зон воздействия около 32 км и 42 км ошибки составили порядка 0.26 км и 0.60 км соответственно.
+\end{frame}
+
+\begin{frame}[t]{Сравнение с подходами из литературы}
+    \fontsize{6.0pt}{6.6pt}\selectfont
+    \renewcommand{\arraystretch}{1.02}
+    \setlength{\tabcolsep}{4pt}
+    \begin{center}
+    \begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}p{0.28\textwidth}>{\raggedright\arraybackslash}p{0.40\textwidth}@{}}
+        \toprule
+        \textbf{Работа} & \textbf{Алгоритм} & \textbf{Практическая применимость и отличия от предлагаемого метода} \\
+        \midrule
+        \tcell{\textbf{Continuous wavelet transform for non-stationary vibration detection with phase-OTDR}\\Z. Qin, L. Chen, X. Bao\\\textit{Optics Express}, 2012} &
+        \tcell{CWT scalogram $\rightarrow$ wavelet ridge $\rightarrow$ global wavelet spectrum $\rightarrow$ location.} &
+        \tcell{Хорошо описывает нестационарные вибрации, но требует полного time-frequency анализа и продемонстрирован на локальном эксперименте с коротким участком воздействия.} \\
+        \midrule
+        \tcell{\textbf{Fiber-optic distributed sensor based on phase-sensitive OTDR and wavelet packet transform for multiple disturbances location}\\\textit{Optik}, 2014} &
+        \tcell{Wavelet packet decomposition $\rightarrow$ relative packet energies $\rightarrow$ disturbed-region selection.} &
+        \tcell{Устойчив к дрейфу частоты лазера и показывает несколько зон сразу, но использует полное вейвлет-пакетное разложение и выдаёт энергетическую карту, а не компактный итоговый score.} \\
+        \midrule
+        \tcell{\textbf{Real-Time Phase-Sensitive OTDR Based on Data Matrix Matching Method}\\X. Liu et al.\\\textit{Sensors}, 2018} &
+        \tcell{Matrix matching $\rightarrow$ differential signal $\rightarrow$ real-time location and waveform extraction.} &
+        \tcell{Даёт отклик 50.1 мс, но построен вокруг конкретной acquisition-схемы и короткой линии 1.2 км; неоднородный фон длинной линии с усилителями там не является центральной проблемой.} \\
+        \midrule
+        \tcell{\textbf{Предлагаемый робастный детектор}} &
+        \tcell{Median background $\rightarrow$ MAD normalization $\rightarrow$ grouped spectral features $\rightarrow$ compact 1D score.} &
+        \tcell{Ориентирован на длинные линии с неоднородным фоном; на выходе даёт одномерный score по расстоянию, который существенно проще интерпретировать, чем двумерную тепловую карту. По памяти финальный результат требует хранения линии признака, а не time-frequency массива; ограничение - чувствительность к качеству парсинга и калибровке порогов.} \\
+        \bottomrule
+    \end{tabular}
+    \end{center}
+\end{frame}
+
+\begin{frame}{Выводы}
+    \begin{itemize}
+        \item Разработан робастный алгоритм детекции возмущений в данных phi-OTDR, ориентированный на длинные волоконные линии с усилителями и неоднородным фоном по расстоянию.
+        \item Ключевое преимущество метода - свёртка time-frequency информации в \textbf{одномерный score по расстоянию}, который существенно проще анализировать, чем двумерные спектральные карты.
+        \item По памяти и по интерпретации такой подход выгоднее полного time-frequency анализа: хранится и анализируется линия признака, а не тепловая карта.
+        \item Метод сохраняет чувствительность уже на \textbf{коротких окнах порядка 0.1 с}: этого достаточно, чтобы просканировать линию длиной порядка 60 км и выделить основные зоны воздействия.
+        \item На контрольном эксперименте автоматически локализованы две основные зоны возмущения около 31.7 км и 42.6 км.
+        \item Дальнейшее развитие работы - стабилизация парсинга на длинных записях и расширение валидации на сценарии нагрева и механического воздействия.
+    \end{itemize}
+\end{frame}
+
+\end{document}

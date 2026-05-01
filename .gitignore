@@ -12,9 +12,11 @@ __pycache__/
 cache/
 logs/
 
-# Data artifacts
-# Keep raw as symlink to external WebDAV mount.
+# Data artifacts and external mounts
+# Keep raw data as symlinks to external storage.
 data/raw
+data/raw_usb
+data/processed_usb
 
 # Generated interim/processed data outputs
 data/interim/*
@@ -28,5 +30,11 @@ reports/figures/*
 reports/tables/*
 !reports/tables/.gitkeep
 
+# Presentation build outputs and local figure assets
+slides/build/
+slides/assets/
+slides/presentation_speaker_notes.*
+
 legacy
-data
+data4
+images
