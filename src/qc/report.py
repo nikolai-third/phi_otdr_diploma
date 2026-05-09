@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 # Ensure non-interactive backend and writable cache in restricted environments.
-cache_root = (Path("data") / "interim" / ".cache").resolve()
-mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+_DEFAULT_CACHE_ROOT = Path("/Volumes/data/phi-OTDR/cache")
+cache_root = Path(os.environ.get("PHI_OTDR_CACHE_ROOT", str(_DEFAULT_CACHE_ROOT))).resolve()
+mpl_root = (cache_root / ".mplconfig").resolve()
 cache_root.mkdir(parents=True, exist_ok=True)
 mpl_root.mkdir(parents=True, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = str(cache_root)

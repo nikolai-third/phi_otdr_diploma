@@ -10,8 +10,11 @@ from pathlib import Path
 import re
 from typing import Any
 
-_cache_root = (Path("data") / "interim" / ".cache").resolve()
-_mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+# Cache lives on the USB volume to avoid filling the system disk with
+# multi-gigabyte memmap files. Override with PHI_OTDR_CACHE_ROOT if needed.
+_DEFAULT_CACHE_ROOT = Path("/Volumes/data/phi-OTDR/cache")
+_cache_root = Path(os.environ.get("PHI_OTDR_CACHE_ROOT", str(_DEFAULT_CACHE_ROOT))).resolve()
+_mpl_root = (_cache_root / ".mplconfig").resolve()
 _memmap_root = (_cache_root / "parser_memmap").resolve()
 _cache_root.mkdir(parents=True, exist_ok=True)
 _mpl_root.mkdir(parents=True, exist_ok=True)

@@ -16,8 +16,9 @@ from typing import Any
 import numpy as np
 
 # Writable matplotlib cache in restricted environments.
-_cache_root = (Path("data") / "interim" / ".cache").resolve()
-_mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+_DEFAULT_CACHE_ROOT = Path("/Volumes/data/phi-OTDR/cache")
+_cache_root = Path(os.environ.get("PHI_OTDR_CACHE_ROOT", str(_DEFAULT_CACHE_ROOT))).resolve()
+_mpl_root = (_cache_root / ".mplconfig").resolve()
 _cache_root.mkdir(parents=True, exist_ok=True)
 _mpl_root.mkdir(parents=True, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = str(_cache_root)
@@ -355,6 +356,7 @@ def run_detection(
     stable_corr_threshold: float,
     stable_min_traces: int,
     use_stable_segment: bool,
+    score_mode: str = "combined",
 ) -> dict[str, Any]:
     data = np.load(aligned_npz)
     aligned = np.asarray(data["aligned"], dtype=np.float32)
@@ -549,7 +551,13 @@ def run_detection(
     energy_rms = np.sqrt(np.mean(grouped**2, axis=0))
     energy_z = (energy_rms - np.median(energy_rms)) / (float(_mad(energy_rms)) + 1e-9)
 
-    combined = 0.55 * peak_score + 0.30 * broad_score + 0.15 * energy_z
+    if score_mode == "energy_only":
+        # Baseline: simple energy-based detector (no spectral features, no MAD over freq).
+        combined = energy_z.astype(np.float32, copy=False)
+    elif score_mode == "peak_only":
+        combined = peak_score.astype(np.float32, copy=False)
+    else:
+        combined = 0.55 * peak_score + 0.30 * broad_score + 0.15 * energy_z
 
     combined_med = float(np.median(combined))
     combined_mad = float(_mad(combined))
@@ -560,8 +568,14 @@ def run_detection(
     peak_thr = peak_med + peak_threshold_k * peak_mad
 
     candidate_score = combined.copy()
+    if score_mode == "combined":
+        # Combined detector also enforces a per-frequency-peak guard.
+        peak_pass = peak_score >= peak_thr
+    else:
+        # Single-component baselines rely solely on the combined-score threshold.
+        peak_pass = combined >= thr
     candidate_mask = (
-        (peak_score >= peak_thr)
+        peak_pass
         & (dist_group >= float(ignore_start_km))
         & (dist_group <= float(usable_end_km))
     )
@@ -824,6 +838,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional reference distances to compare against",
     )
+    p.add_argument(
+        "--score-mode",
+        choices=["combined", "energy_only", "peak_only"],
+        default="combined",
+        help="Detector score formula. 'combined' (default) is the proposed method; "
+             "'energy_only' is the simple RMS baseline; 'peak_only' uses only the spectral peak z-score.",
+    )
     return p
 
 
@@ -849,6 +870,7 @@ def main(argv: list[str] | None = None) -> int:
         stable_corr_threshold=args.stable_corr_threshold,
         stable_min_traces=args.stable_min_traces,
         use_stable_segment=args.use_stable_segment,
+        score_mode=args.score_mode,
     )
 
     print(f"outdir={outdir}")

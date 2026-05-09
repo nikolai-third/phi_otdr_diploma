@@ -18,8 +18,9 @@ import sys
 import time
 from typing import Any
 
-_cache_root = (Path("data") / "interim" / ".cache").resolve()
-_mpl_root = (Path("data") / "interim" / ".mplconfig").resolve()
+_DEFAULT_CACHE_ROOT = Path("/Volumes/data/phi-OTDR/cache")
+_cache_root = Path(os.environ.get("PHI_OTDR_CACHE_ROOT", str(_DEFAULT_CACHE_ROOT))).resolve()
+_mpl_root = (_cache_root / ".mplconfig").resolve()
 _cache_root.mkdir(parents=True, exist_ok=True)
 _mpl_root.mkdir(parents=True, exist_ok=True)
 os.environ["XDG_CACHE_HOME"] = str(_cache_root)
