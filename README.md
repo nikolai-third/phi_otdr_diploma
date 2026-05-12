@@ -5,6 +5,38 @@
 
 `dataset audit` и `baseline pipeline` — воспроизводимые этапы первичной обработки и контроля качества всего массива данных.
 
+## Сам диплом
+
+- [thesis/main.pdf](thesis/main.pdf) — собранный PDF (финальная версия, 36 страниц).
+- [thesis/main.tex](thesis/main.tex) — исходник на XeLaTeX (Times New Roman, поля 30/15/20/20 мм, шрифт 12 пт, межстрочный 1.5 — по Положению о ВКР МФТИ, Приложение 2).
+- [thesis/figures/](thesis/figures/) — рисунки для главы 3-4 (рефлектограмма, водопадная диаграмма, спектральная карта, компоненты оценки $S(g)$, гистограммы и сравнительные диаграммы).
+- [thesis/THESIS_OUTLINE.md](thesis/THESIS_OUTLINE.md), [thesis/THESIS_PLAN.md](thesis/THESIS_PLAN.md) — план работы и литературный обзор (рабочие документы, в PDF не входят).
+
+### Сборка PDF
+
+```bash
+# 1. Перегенерировать рисунки из исходного датасета
+#    (требует примонтированной флешки /Volumes/data/phi-OTDR/)
+.venv/bin/python scripts/make_thesis_figures.py
+
+# 2. Скомпилировать диплом (XeLaTeX, два прохода для ссылок)
+cd thesis
+xelatex -interaction=nonstopmode main.tex
+xelatex -interaction=nonstopmode main.tex
+```
+
+Скрипт [scripts/make_thesis_figures.py](scripts/make_thesis_figures.py) собирает все рисунки диплома: 4 диаграммы из CSV в `reports/tables/` (метрики, гистограмма ошибки локализации, сравнение детекторов, Recall по импульсам) и 7 диаграмм с эталонной размеченной записи `aligned.npz` (рефлектограмма, водопад, фон+MAD, нормированный водопад, FFT-карта, компоненты $S(g)$, финальный детект). Подписи осей и легенды на русском.
+
+### Список литературы
+
+Оформлен по ГОСТ Р 7.0.100-2018 (национальный стандарт РФ для библиографических записей): инвертированный заголовок «Фамилия, И. О.», полная зона ответственности после `/`, предписанная пунктуация `. -`, для 5+ авторов — первые три + `[et al.]`. В списке 25 источников: обзорные работы по DOFS и DAS, foundational phi-OTDR (Posey 2000, Juarez 2005), длиннолинейные демонстрации с EDFA/Raman-усилением (Peng, Martins, Wang Z. N., Tian, Wang Y., Fan), методы обработки сигналов phi-OTDR (CWT, HHT, вейвлет-пакеты, матричное сопоставление), event recognition (Tejedor, Wu, Shi), методическая ссылка на устойчивую к выбросам статистику (Hampel 1974). Все DOI проверены через Crossref API.
+
+## Презентация защиты
+
+В директории [slides/](slides/):
+- `presentation_phi_otdr.pdf` / `.tex` — слайды защиты (Beamer).
+- `presentation_speaker_notes.pdf` / `.tex` — заметки докладчика построчно к слайдам.
+
 ## Данные и ограничения
 
 - `data/raw` — symlink на WebDAV: `/Volumes/webdav.yandex.ru/phi-OTDR`
