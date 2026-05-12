@@ -96,12 +96,17 @@ def _signed_clip(a, q_abs=0.995):
     return -v, v
 
 
-def compute_detector(npz_path: Path, group_bins: int = 20, freq_min_hz: float = 5.0):
+def compute_detector(npz_path: Path, group_bins: int = 20, freq_min_hz: float = 5.0,
+                     max_traces: int | None = None):
     data = np.load(npz_path)
     aligned = np.asarray(data["aligned"], dtype=np.float32)
     starts = np.asarray(data["starts"], dtype=np.int64)
     trace_len = int(data["trace_len"])
     adc_fs_hz = float(data["adc_fs_hz"])
+
+    if max_traces is not None and aligned.shape[0] > max_traces:
+        aligned = aligned[:max_traces]
+        starts = starts[:max_traces]
 
     n_traces, n_bins = aligned.shape
     dist_km = np.arange(n_bins) * (C0 / (2.0 * N_FIBER * adc_fs_hz)) / 1000.0
@@ -307,26 +312,141 @@ def fig_fft_map(d):
     plt.close(fig)
 
 
-def fig_score_components(d):
-    fig, ax = plt.subplots(figsize=(10, 4.0))
-    ax.plot(d["dist_group"], d["peak_score"], color="#1f4e79",
-            linewidth=1.0, label="спектральный пик")
-    ax.plot(d["dist_group"], d["broad_score"], color="#c98a1d",
-            linewidth=1.0, label="широкополосная активность")
-    ax.plot(d["dist_group"], d["energy_z"], color="#3a8a3a",
-            linewidth=1.0, alpha=0.8, label="энергия (RMS, z-оценка)")
-    ax.plot(d["dist_group"], d["combined"], color="black",
-            linewidth=1.4, label="комбинированный score")
-    ax.axhline(d["combined_thr"], color="#a6324a", linestyle="--",
-               linewidth=1.0, label=f"порог combined = {d['combined_thr']:.2f}")
-    ax.axhline(d["peak_thr"], color="#7a3aa6", linestyle=":",
-               linewidth=1.0, label=f"порог peak = {d['peak_thr']:.2f}")
-    ax.set_xlabel("Дистанция, км")
-    ax.set_ylabel("Score")
-    ax.set_title("Спектральный score детектора по дистанции")
-    ax.set_xlim(d["dist_group"][0], d["dist_group"][-1])
-    ax.legend(ncol=2, loc="upper left", framealpha=0.92)
+def _find_detections(dg, combined, peak_score, combined_thr, peak_thr,
+                     min_sep_km=2.0, max_n=6):
+    """Replicate the detection logic used in fig_final_detection: pick local
+    maxima of combined that pass both gates, suppress neighbours within
+    min_sep_km."""
+    mask = (combined >= combined_thr) & (peak_score >= peak_thr)
+    candidates = []
+    for i in np.where(mask)[0]:
+        if 0 < i < len(combined) - 1 and \
+           combined[i] >= combined[i - 1] and combined[i] >= combined[i + 1]:
+            candidates.append((float(dg[i]), float(combined[i])))
+    candidates.sort(key=lambda t: -t[1])
+    picked = []
+    for d_km, s in candidates:
+        if all(abs(d_km - p[0]) >= min_sep_km for p in picked):
+            picked.append((d_km, s))
+        if len(picked) >= max_n:
+            break
+    return picked
+
+
+def fig_score_components(d, expected_km=(32.0, 42.0)):
+    """2x2 panel: peak / broad / energy_z / combined - each in its own subplot,
+    same x-axis (distance), labelled disturbance zones and detection markers
+    overlaid on every panel."""
+    dg = d["dist_group"]
+    detections = _find_detections(dg, d["combined"], d["peak_score"],
+                                  d["combined_thr"], d["peak_thr"])
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 5.8), sharex=True)
+
+    series = [
+        (axes[0, 0], d["peak_score"],  "#1f4e79", "Спектральный пик",                 "z-оценка"),
+        (axes[0, 1], d["broad_score"], "#c98a1d", "Широкополосная активность",        "оценка"),
+        (axes[1, 0], d["energy_z"],    "#3a8a3a", "Энергия во временной области",     "z-оценка"),
+        (axes[1, 1], d["combined"],    "black",   "Комбинированная оценка $S(g)$",    "оценка $S(g)$"),
+    ]
+
+    # base curves + axes labels
+    for ax, y, color, title, ylabel in series:
+        ax.plot(dg, y, color=color, linewidth=0.9)
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(dg[0], dg[-1])
+
+    # labelled ground truth zones (yellow) on every panel
+    for ax, *_ in series:
+        for ek in expected_km:
+            ax.axvspan(ek - 0.5, ek + 0.5, color="#c98a1d", alpha=0.18)
+
+    # detected candidates: same vertical magenta lines on every panel
+    for ax, *_ in series:
+        for d_km, _ in detections:
+            ax.axvline(d_km, color="#a6324a", linestyle="-", linewidth=0.9, alpha=0.85)
+
+    # threshold lines on the relevant panels + legends
+    axes[0, 0].axhline(d["peak_thr"], color="#a6324a", linestyle="--",
+                       linewidth=1.0, label=f"порог $P_\\mathrm{{thr}} = {d['peak_thr']:.2f}$")
+    axes[1, 1].axhline(d["combined_thr"], color="#a6324a", linestyle="--",
+                       linewidth=1.0, label=f"порог $S_\\mathrm{{thr}} = {d['combined_thr']:.2f}$")
+    axes[0, 0].legend(loc="upper right", framealpha=0.92, fontsize=10)
+    axes[1, 1].legend(loc="upper right", framealpha=0.92, fontsize=10)
+
+    # detection markers are the vertical lines themselves; no numeric labels
+    # on the figure to keep panels readable
+
+    # bottom-row x label
+    for ax in axes[1, :]:
+        ax.set_xlabel("Дистанция, км")
+
+    fig.tight_layout()
     fig.savefig(FIG_DIR / "fig_score_components.png")
+    plt.close(fig)
+
+
+def fig_short_window(npz_path, n_traces=100, expected_km=(32.0, 42.0)):
+    """Run the detector on only n_traces reflectograms (~0.1 s of data on
+    a ~1 kHz trace rate). Demonstrates that detection still works on a very
+    short data window."""
+    d = compute_detector(npz_path, max_traces=n_traces)
+    duration_s = d["trace_period_s"] * d["aligned"].shape[0]
+    dg = d["dist_group"]
+    detections = _find_detections(dg, d["combined"], d["peak_score"],
+                                  d["combined_thr"], d["peak_thr"])
+
+    fig, ax = plt.subplots(figsize=(10, 3.8))
+    ax.plot(dg, d["combined"], color="black", linewidth=1.0,
+            label="комбинированная оценка $S(g)$")
+    ax.axhline(d["combined_thr"], color="#a6324a", linestyle="--",
+               linewidth=1.0, label=f"порог $S_\\mathrm{{thr}} = {d['combined_thr']:.2f}$")
+    for k, ek in enumerate(expected_km):
+        ax.axvspan(ek - 0.5, ek + 0.5, color="#c98a1d", alpha=0.18,
+                   label="эталонная зона ±0.5 км" if k == 0 else None)
+    if detections:
+        xs, ys = zip(*detections)
+        ax.scatter(xs, ys, marker="o", s=70,
+                   facecolor="#a6324a", edgecolor="black", zorder=5,
+                   label="детекции")
+    ax.set_xlabel("Дистанция, км")
+    ax.set_ylabel("Оценка $S(g)$")
+    ax.set_title(f"Детект на {n_traces} рефлектограммах ($\\approx {duration_s:.2f}$ с записи)")
+    ax.set_xlim(dg[0], dg[-1])
+    ax.legend(loc="upper right", framealpha=0.92)
+    fig.savefig(FIG_DIR / "fig_short_window_100.png")
+    plt.close(fig)
+
+
+def fig_final_detection_inline(d, expected_km=(32.0, 42.0)):
+    """Kept the original single-panel final detection for §4.2."""
+    detections = _find_detections(d["dist_group"], d["combined"], d["peak_score"],
+                                  d["combined_thr"], d["peak_thr"])
+
+    fig, ax = plt.subplots(figsize=(10, 4.2))
+    dg = d["dist_group"]
+    ax.plot(dg, d["combined"], color="black", linewidth=1.0,
+            label="комбинированная оценка $S(g)$")
+    ax.axhline(d["combined_thr"], color="#a6324a", linestyle="--",
+               linewidth=1.0, label=f"порог = {d['combined_thr']:.2f}")
+    for k, ek in enumerate(expected_km):
+        ax.axvspan(ek - 0.5, ek + 0.5, color="#c98a1d", alpha=0.18,
+                   label="эталонная зона ±0.5 км" if k == 0 else None)
+    if detections:
+        xs, ys = zip(*detections)
+        ax.scatter(xs, ys, marker="o", s=70,
+                   facecolor="#a6324a", edgecolor="black", zorder=5,
+                   label="детекции")
+        for x, y in detections:
+            ax.annotate(f"{x:.1f}", (x, y), textcoords="offset points",
+                        xytext=(6, 6), fontsize=10)
+    ax.set_xlabel("Дистанция, км")
+    ax.set_ylabel("Оценка $S(g)$")
+    ax.set_title("Финальный детект на эталонной размеченной записи")
+    ax.set_xlim(dg[0], dg[-1])
+    ax.legend(loc="upper right", framealpha=0.92)
+    fig.savefig(FIG_DIR / "fig_final_detection.png")
     plt.close(fig)
 
 
@@ -354,7 +474,7 @@ def fig_final_detection(d, expected_km=(32.0, 42.0)):
             break
 
     fig, ax = plt.subplots(figsize=(10, 4.2))
-    ax.plot(dg, cs, color="black", linewidth=1.0, label="комбинированный score")
+    ax.plot(dg, cs, color="black", linewidth=1.0, label="комбинированная оценка $S(g)$")
     ax.axhline(thr, color="#a6324a", linestyle="--",
                linewidth=1.0, label=f"порог = {thr:.2f}")
     for ek in expected_km:
@@ -369,7 +489,7 @@ def fig_final_detection(d, expected_km=(32.0, 42.0)):
             ax.annotate(f"{x:.1f}", (x, y), textcoords="offset points",
                         xytext=(6, 6), fontsize=10)
     ax.set_xlabel("Дистанция, км")
-    ax.set_ylabel("Score")
+    ax.set_ylabel("Оценка $S(g)$")
     ax.set_title("Финальный детект на эталонной размеченной записи")
     ax.set_xlim(dg[0], dg[-1])
     ax.legend(loc="upper right", framealpha=0.92)
@@ -398,7 +518,7 @@ def fig_loc_err_hist():
             edgecolor="white", label=f"пороговый детект ($n={len(err)}$)")
     ax.hist(np.clip(err_top.values, 0.0, 5.0), bins=bins,
             color="#c98a1d", alpha=0.55, edgecolor="white",
-            label=f"топ-кандидат в usable ($n={len(err_top)}$)")
+            label=f"топ-кандидат в полезной зоне ($n={len(err_top)}$)")
     ax.axvline(0.5, color="#a6324a", linestyle="--", linewidth=1.0,
                label="допуск ±0.5 км")
     ax.set_xlabel("Ошибка локализации, км")
@@ -464,10 +584,10 @@ def _metrics(df):
 
 def fig_f1_bars():
     runs = [
-        ("combined\n(предложенный)", _read_eval("data_for_ml_eval.csv")),
-        ("combined relaxed", _read_eval("data_for_ml_eval_relaxed.csv")),
-        ("peak only", _read_eval("data_for_ml_eval_peak.csv")),
-        ("energy only", _read_eval("data_for_ml_eval_energy.csv")),
+        ("Комбинированный\n(предложенный)", _read_eval("data_for_ml_eval.csv")),
+        ("Комбинированный\n(ослабленный)", _read_eval("data_for_ml_eval_relaxed.csv")),
+        ("Только пик", _read_eval("data_for_ml_eval_peak.csv")),
+        ("Только энергия", _read_eval("data_for_ml_eval_energy.csv")),
     ]
     labels = []
     rec, prc, f1s = [], [], []
@@ -509,7 +629,7 @@ def fig_recall_by_pulse():
     w = 0.4
     fig, ax = plt.subplots(figsize=(8, 4.2))
     ax.bar(x - w/2, rec_thr, w, color="#1f4e79", label="пороговый детект")
-    ax.bar(x + w/2, rec_top, w, color="#c98a1d", label="топ-кандидат в usable")
+    ax.bar(x + w/2, rec_top, w, color="#c98a1d", label="топ-кандидат в полезной зоне")
     for i, (rt, rl) in enumerate(zip(rec_thr, rec_top)):
         ax.text(i - w/2, rt + 0.02, f"{rt:.2f}", ha="center", fontsize=10)
         ax.text(i + w/2, rl + 0.02, f"{rl:.2f}", ha="center", fontsize=10)
@@ -547,6 +667,7 @@ def main():
     fig_scatter()
     fig_f1_bars()
     fig_recall_by_pulse()
+    fig_short_window(REF_NPZ, n_traces=100)
 
     print("done.")
 
